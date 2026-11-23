@@ -1,0 +1,3709 @@
+#!/usr/bin/env python3
+"""
+moodle - a terminal client for Moodle.
+
+Talks to the same web service the official Moodle mobile app uses
+(moodle_mobile_app), so it works on any site where the mobile app works.
+
+  * no root / sudo needed      (install into ~/.local/bin)
+  * no browser, no cookies     (logs in with username + password -> app token)
+  * no third-party packages    (Python 3.8+ standard library only)
+
+Run `moodle` for the interactive shell, or `moodle <command> [args]`
+for one-shot use, e.g. `moodle todo` or `moodle sync all`.
+"""
+
+import base64
+import cmd
+import getpass
+import hashlib
+import json
+import mimetypes
+import os
+import random
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from datetime import datetime
+from html.parser import HTMLParser
+from pathlib import Path
+
+VERSION = "1.4"
+APP = "moodle-cli"
+UA = f"{APP}/{VERSION} (Python urllib)"
+SERVICE = "moodle_mobile_app"
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / APP
+CONFIG_FILE = CONFIG_DIR / "config.json"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / APP
+HISTORY_FILE = STATE_DIR / "history"
+DEFAULT_DL = Path.home() / "Moodle"
+
+# --------------------------------------------------------------------------- #
+#  Output helpers
+# --------------------------------------------------------------------------- #
+
+USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+
+
+def _c(code):
+    return lambda t: f"\033[{code}m{t}\033[0m" if USE_COLOR else str(t)
+
+
+bold, dim, red, green, yellow, blue, magenta, cyan = (
+    _c("1"), _c("2"), _c("31"), _c("32"), _c("33"), _c("34"), _c("35"), _c("36"))
+
+
+def err(msg):
+    print(red("error: ") + str(msg), file=sys.stderr)
+
+
+def info(msg):
+    print(dim(msg), file=sys.stderr)
+
+
+def width():
+    return max(40, min(shutil.get_terminal_size((100, 24)).columns, 110))
+
+
+def page(text):
+    """Print text, through a pager if it does not fit on the screen."""
+    if not sys.stdout.isatty():
+        print(text)
+        return
+    rows = shutil.get_terminal_size((100, 24)).lines
+    if text.count("\n") + 2 < rows:
+        print(text)
+        return
+    pager = os.environ.get("PAGER")
+    argv = shlex.split(pager) if pager else ["less", "-R", "-F", "-X"]
+    try:
+        p = subprocess.Popen(argv, stdin=subprocess.PIPE)
+        p.communicate(text.encode("utf-8", "replace"))
+    except (FileNotFoundError, OSError):
+        print(text)
+
+
+def human(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def fmt_time(ts):
+    if not ts:
+        return "-"
+    return datetime.fromtimestamp(int(ts)).strftime("%a %d %b %Y %H:%M")
+
+
+def rel(ts):
+    if not ts:
+        return ""
+    d = int(ts) - time.time()
+    a = abs(d)
+    if a < 3600:
+        s = f"{int(a // 60)}m"
+    elif a < 86400:
+        s = f"{int(a // 3600)}h {int(a % 3600 // 60)}m"
+    else:
+        s = f"{int(a // 86400)}d {int(a % 86400 // 3600)}h"
+    return f"in {s}" if d > 0 else f"{s} ago"
+
+
+def due_color(ts, text):
+    if not ts:
+        return text
+    d = int(ts) - time.time()
+    if d < 0:
+        return red(text)
+    if d < 86400 * 2:
+        return yellow(text)
+    return text
+
+
+def safe_name(name, limit=100):
+    name = re.sub(r"[/\\\x00-\x1f]", "_", str(name or "")).strip().strip(".")
+    return (name or "_")[:limit]
+
+
+def confirm(question, default=False):
+    if not sys.stdin.isatty():
+        return default
+    hint = "[Y/n]" if default else "[y/N]"
+    try:
+        ans = input(f"{question} {hint} ").strip().lower()
+    except EOFError:
+        return default
+    return default if not ans else ans in ("y", "yes", "j", "ja")
+
+
+def args_of(line):
+    try:
+        return shlex.split(line)
+    except ValueError:
+        return line.split()
+
+
+def parse_nums(tokens, maximum):
+    """'1 3 5-7' -> [1,3,5,6,7]; 'all' -> 1..maximum"""
+    out = []
+    for t in tokens:
+        if t == "all":
+            return list(range(1, maximum + 1))
+        m = re.fullmatch(r"(\d+)-(\d+)", t)
+        if m:
+            out += list(range(int(m.group(1)), int(m.group(2)) + 1))
+        elif t.isdigit():
+            out.append(int(t))
+        else:
+            raise MoodleError(f"not a number: {t}")
+    for n in out:
+        if not 1 <= n <= maximum:
+            raise MoodleError(f"number {n} out of range (1-{maximum})")
+    return out
+
+
+def edit_text(initial=""):
+    """Open $EDITOR for longer text; returns the text (without # comment lines)."""
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    if not editor:
+        for e in ("nano", "vim", "vi"):
+            if shutil.which(e):
+                editor = e
+                break
+    if not editor:
+        print("No $EDITOR found. Type your text, finish with a line containing only '.':")
+        lines = []
+        while True:
+            try:
+                ln = input()
+            except EOFError:
+                break
+            if ln == ".":
+                break
+            lines.append(ln)
+        return "\n".join(lines).strip()
+    with tempfile.NamedTemporaryFile("w+", suffix=".txt", delete=False) as f:
+        f.write(initial + "\n# Lines starting with # are ignored. Save and quit to send; leave empty to cancel.\n")
+        path = f.name
+    try:
+        subprocess.call(shlex.split(editor) + [path])
+        with open(path, encoding="utf-8") as f:
+            return "\n".join(l for l in f.read().splitlines() if not l.startswith("#")).strip()
+    finally:
+        os.unlink(path)
+
+
+def text_to_html(text):
+    import html as _h
+    paras = [p for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
+    return "".join("<p>" + _h.escape(p).replace("\n", "<br>") + "</p>" for p in paras)
+
+
+# --------------------------------------------------------------------------- #
+#  HTML -> terminal text
+# --------------------------------------------------------------------------- #
+
+BLOCK = {"p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "table", "ul", "ol",
+         "blockquote", "pre", "section", "article", "header", "footer", "hr", "dl",
+         "dt", "dd", "figure", "figcaption"}
+
+
+class _H2T(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts, self.links = [], []
+        self.skip = self.pre = 0
+        self.href = None
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag in ("script", "style", "head", "title"):
+            self.skip += 1
+        elif tag == "br":
+            self.parts.append("\n")
+        elif tag == "li":
+            self.parts.append("\n  • ")
+        elif tag in ("td", "th"):
+            self.parts.append("  ")
+        elif tag == "img":
+            self.parts.append(f"[{a.get('alt') or 'image'}]")
+        elif tag == "a":
+            self.href = a.get("href")
+        elif tag in BLOCK:
+            self.parts.append("\n\n" if tag in ("p", "h1", "h2", "h3") else "\n")
+        if tag == "pre":
+            self.pre += 1
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "head", "title"):
+            self.skip = max(0, self.skip - 1)
+        elif tag == "a":
+            if self.href and not self.href.startswith(("#", "javascript:", "mailto:")):
+                self.links.append(self.href)
+                self.parts.append(f"[{len(self.links)}]")
+            self.href = None
+        elif tag in BLOCK:
+            self.parts.append("\n")
+        if tag == "pre":
+            self.pre = max(0, self.pre - 1)
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.parts.append(data if self.pre else re.sub(r"\s+", " ", data))
+
+
+def html2text(s, links=True, indent=""):
+    if not s:
+        return ""
+    p = _H2T()
+    try:
+        p.feed(s)
+        p.close()
+        text = "".join(p.parts)
+    except Exception:
+        text = re.sub(r"<[^>]+>", " ", s)
+    w = width() - len(indent)
+    out = []
+    for line in text.split("\n"):
+        line = line.rstrip()
+        if not line.startswith("  •"):
+            line = line.strip()
+        if len(line) > w:
+            lead = " " * (len(line) - len(line.lstrip()) + (2 if line.startswith("  •") else 0))
+            out += textwrap.wrap(line, w, subsequent_indent=lead) or [""]
+        else:
+            out.append(line)
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+    if links and p.links:
+        text += "\n\n" + "\n".join(dim(f"[{i}] {u}") for i, u in enumerate(p.links, 1))
+    if indent:
+        text = "\n".join(indent + l for l in text.split("\n"))
+    return text
+
+
+# --------------------------------------------------------------------------- #
+#  Moodle web service client
+# --------------------------------------------------------------------------- #
+
+class MoodleError(Exception):
+    pass
+
+
+def flatten(obj, prefix=""):
+    """Encode nested params the way Moodle's REST server expects: a[0][b]=c"""
+    out = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            out += flatten(v, f"{prefix}[{k}]" if prefix else str(k))
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            out += flatten(v, f"{prefix}[{i}]")
+    elif obj is not None:
+        if isinstance(obj, bool):
+            obj = int(obj)
+        out.append((prefix, str(obj)))
+    return out
+
+
+def normalize_url(url):
+    url = url.strip()
+    if not re.match(r"^https?://", url, re.I):
+        url = "https://" + url
+    url = re.sub(r"/(login|my|course|user|mod|admin)(/.*)?$", "", url.split("?")[0].split("#")[0])
+    return url.rstrip("/")
+
+
+class Moodle:
+    def __init__(self, url, token=None):
+        self.url = normalize_url(url)
+        self.token = token
+
+    # -- low level ---------------------------------------------------------- #
+    def _open(self, url, data=None, headers=None, timeout=60):
+        h = {"User-Agent": UA}
+        h.update(headers or {})
+        req = urllib.request.Request(url, data=data, headers=h)
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            raise MoodleError(f"HTTP {e.code} {e.reason} ({url.split('?')[0]})")
+        except urllib.error.URLError as e:
+            raise MoodleError(f"cannot connect to {self.url}: {e.reason}")
+        except TimeoutError:
+            raise MoodleError(f"timeout talking to {self.url}")
+
+    def _json(self, resp):
+        raw = resp.read()
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except ValueError:
+            snippet = raw[:200].decode("utf-8", "replace").strip()
+            raise MoodleError(f"unexpected (non-JSON) answer from server: {snippet!r}")
+
+    # -- login -------------------------------------------------------------- #
+    def public_config(self):
+        """Site config available without login (site name, login type, ...)."""
+        body = json.dumps([{"index": 0, "methodname": "tool_mobile_get_public_config", "args": {}}]).encode()
+        with self._open(self.url + "/lib/ajax/service-nologin.php?info=tool_mobile_get_public_config",
+                        body, {"Content-Type": "application/json"}, timeout=20) as r:
+            res = self._json(r)
+        if isinstance(res, list) and res and not res[0].get("error"):
+            return res[0].get("data") or {}
+        raise MoodleError("public config not available")
+
+    def login(self, username, password):
+        data = urllib.parse.urlencode({"username": username, "password": password, "service": SERVICE}).encode()
+        with self._open(self.url + "/login/token.php", data) as r:
+            res = self._json(r)
+        if not res.get("token"):
+            code = res.get("errorcode", "")
+            msg = res.get("error") or "login failed"
+            hints = {
+                "invalidlogin": "wrong username or password (if your site uses SSO/Microsoft/Google login, use `login --sso`)",
+                "enablewsdescription": "this site has disabled web services / the mobile app — ask your Moodle admin",
+                "servicenotavailable": "the mobile app service is disabled on this site",
+                "sitepolicynotagreed": "you must accept the site policy once (in any browser, e.g. your phone), then retry",
+                "usernotconfirmed": "your account is not confirmed yet",
+            }
+            raise MoodleError(f"{msg}" + (f"\n  hint: {hints[code]}" if code in hints else ""))
+        self.token = res["token"]
+        return res
+
+    # -- web service calls -------------------------------------------------- #
+    def call(self, function, **params):
+        if not self.token:
+            raise MoodleError("not logged in — run `login`")
+        fields = [("wstoken", self.token), ("wsfunction", function), ("moodlewsrestformat", "json")]
+        data = urllib.parse.urlencode(fields + flatten(params)).encode()
+        with self._open(f"{self.url}/webservice/rest/server.php?wsfunction={function}", data) as r:
+            res = self._json(r)
+        if isinstance(res, dict) and "exception" in res:
+            code = res.get("errorcode", "")
+            raise MoodleError(f"{function}: {res.get('message', '')} [{code}]" +
+                              ("\n  hint: your login expired — run `login` again" if code in ("invalidtoken", "accessexception") and "token" in res.get("message", "").lower() else ""))
+        return res
+
+    def try_call(self, functions, **params):
+        """Try several function names (for compatibility with older/newer Moodles)."""
+        last = None
+        for fn in functions:
+            try:
+                return self.call(fn, **params)
+            except MoodleError as e:
+                last = e
+                if "invalidtoken" in str(e):
+                    raise
+        raise last
+
+    # -- files -------------------------------------------------------------- #
+    def file_url(self, url):
+        if "/pluginfile.php" in url and "/webservice/pluginfile.php" not in url:
+            url = url.replace("/pluginfile.php", "/webservice/pluginfile.php", 1)
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}token={urllib.parse.quote(self.token)}"
+
+    def fetch(self, url):
+        with self._open(self.file_url(url), timeout=120) as r:
+            return r.read()
+
+    def download(self, url, dest, mtime=None, show=True):
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + ".part")
+        with self._open(self.file_url(url), timeout=300) as r:
+            ctype = r.headers.get("Content-Type", "")
+            total = int(r.headers.get("Content-Length") or 0)
+            if "application/json" in ctype and not dest.name.endswith(".json"):
+                res = self._json(r)
+                raise MoodleError(res.get("error") or res.get("message") or "download failed")
+            done = 0
+            with open(tmp, "wb") as f:
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    if show and sys.stderr.isatty() and total > 1_000_000:
+                        print(f"\r    {done * 100 // total:3d}%  {human(done)} / {human(total)}", end="", file=sys.stderr)
+            if show and sys.stderr.isatty() and total > 1_000_000:
+                print("\r" + " " * 40 + "\r", end="", file=sys.stderr)
+        tmp.replace(dest)
+        if mtime:
+            os.utime(dest, (mtime, mtime))
+        return done
+
+    def upload(self, paths):
+        """Upload files into a new draft area; returns its itemid."""
+        boundary = uuid.uuid4().hex
+        chunks = []
+        for k, v in (("token", self.token), ("filearea", "draft"), ("itemid", "0")):
+            chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode())
+        for i, p in enumerate(paths):
+            p = Path(p)
+            ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+            fname = p.name.replace('"', "_")
+            chunks.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file_{i}"; filename="{fname}"\r\n'
+                          f"Content-Type: {ctype}\r\n\r\n".encode())
+            chunks.append(p.read_bytes())
+            chunks.append(b"\r\n")
+        chunks.append(f"--{boundary}--\r\n".encode())
+        with self._open(self.url + "/webservice/upload.php", b"".join(chunks),
+                        {"Content-Type": f"multipart/form-data; boundary={boundary}"}, timeout=600) as r:
+            res = self._json(r)
+        if isinstance(res, dict):
+            raise MoodleError(res.get("error") or res.get("message") or "upload failed")
+        if not res or "itemid" not in res[0]:
+            raise MoodleError(f"upload failed: {res}")
+        return res[0]["itemid"]
+
+
+# --------------------------------------------------------------------------- #
+#  Config
+# --------------------------------------------------------------------------- #
+
+def load_config():
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(CONFIG_DIR, 0o700)
+    fd = os.open(CONFIG_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod(CONFIG_FILE, 0o600)
+
+
+# --------------------------------------------------------------------------- #
+#  Quiz questions: question HTML -> text + answer fields
+# --------------------------------------------------------------------------- #
+
+VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+             "source", "track", "wbr"}
+QUIZ_HIDE = {"accesshide", "sr-only", "visually-hidden", "questionflag", "im-controls",
+             "qtype_multichoice_clearchoice", "questioncorrectnessicon", "answernumber-hidden"}
+QUIZ_MARK = "⟨{}⟩"
+
+
+class Node:
+    __slots__ = ("tag", "attrs", "children", "parent")
+
+    def __init__(self, tag, attrs=None, parent=None):
+        self.tag, self.attrs, self.children, self.parent = tag, dict(attrs or []), [], parent
+
+    @property
+    def classes(self):
+        return set((self.attrs.get("class") or "").split())
+
+    def iter(self):
+        for c in self.children:
+            if isinstance(c, Node):
+                yield c
+                yield from c.iter()
+
+    def find(self, pred):
+        return next((n for n in self.iter() if pred(n)), None)
+
+    def ancestor(self, pred, levels=50):
+        n = self.parent
+        while n is not None and levels > 0:
+            if pred(n):
+                return n
+            n, levels = n.parent, levels - 1
+        return None
+
+    def contains(self, other):
+        n = other
+        while n is not None:
+            if n is self:
+                return True
+            n = n.parent
+        return False
+
+    def text(self):
+        return "".join(c if isinstance(c, str) else c.text() for c in self.children)
+
+
+class _DOM(HTMLParser):
+    """Tiny tolerant HTML -> tree parser (enough for Moodle question HTML)."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.root = Node("#root")
+        self.cur = self.root
+
+    def handle_starttag(self, tag, attrs):
+        n = Node(tag, attrs, self.cur)
+        self.cur.children.append(n)
+        if tag not in VOID_TAGS:
+            self.cur = n
+
+    def handle_startendtag(self, tag, attrs):
+        self.cur.children.append(Node(tag, attrs, self.cur))
+
+    def handle_endtag(self, tag):
+        n = self.cur
+        while n is not self.root and n.tag != tag:
+            n = n.parent
+        if n is not self.root:
+            self.cur = n.parent
+
+    def handle_data(self, data):
+        self.cur.children.append(data)
+
+
+def parse_dom(src):
+    d = _DOM()
+    try:
+        d.feed(src or "")
+        d.close()
+    except Exception:
+        pass
+    return d.root
+
+
+def serialize(node, tf):
+    """Node children -> HTML. tf(node) may return a replacement string (or None to keep)."""
+    import html as _h
+    out = []
+
+    def walk(n):
+        for c in n.children:
+            if isinstance(c, str):
+                out.append(_h.escape(c, quote=False))
+                continue
+            r = tf(c)
+            if r is not None:
+                out.append(r)
+                continue
+            attrs = "".join(f' {k}="{_h.escape(v, quote=True)}"' if v is not None else f" {k}"
+                            for k, v in c.attrs.items())
+            out.append(f"<{c.tag}{attrs}>")
+            if c.tag not in VOID_TAGS:
+                walk(c)
+                out.append(f"</{c.tag}>")
+    walk(node)
+    return "".join(out)
+
+
+def _input_type(n):
+    return (n.attrs.get("type") or "text").lower() if n.tag == "input" else n.tag
+
+
+def _result_of(n):
+    """correct / incorrect / partiallycorrect class on the control or its row (review pages)."""
+    for x in (n, n.parent, n.parent.parent if n.parent else None):
+        if x is None:
+            continue
+        c = x.classes
+        for r in ("partiallycorrect", "incorrect", "correct"):
+            if r in c:
+                return r
+    return None
+
+
+def parse_question(src):
+    """Parse one question's HTML (from mod_quiz_get_attempt_data / _review).
+
+    Returns {text, fields, hidden, images, notes}:
+      fields  — answer controls the user can fill in (radio/checkbox/select/text/textarea)
+      hidden  — [(name, value)] hidden inputs (sequencecheck etc.) that must be sent back
+    """
+    import html as _h
+    root = parse_dom(src)
+    que = root.find(lambda n: "que" in n.classes) or root
+    content = que.find(lambda n: "content" in n.classes) or que
+    byid, labfor = {}, {}
+    for n in root.iter():
+        if n.attrs.get("id"):
+            byid.setdefault(n.attrs["id"], n)
+        if n.tag == "label" and n.attrs.get("for"):
+            labfor.setdefault(n.attrs["for"], n)
+
+    hidden, fields, notes = [], [], []
+    drop, marks, label_nodes = set(), {}, []
+    radios = {}
+    prev = None
+    for n in que.iter():
+        if n.tag not in ("input", "select", "textarea"):
+            continue
+        name = n.attrs.get("name")
+        t = _input_type(n)
+        if not name or t in ("submit", "button", "image", "reset"):
+            continue
+        if t == "hidden":
+            hidden.append((name, n.attrs.get("value") or ""))
+            continue
+        if name.endswith(":flagged"):  # the "flag question" checkbox
+            if "checked" in n.attrs:
+                hidden.append((name, n.attrs.get("value") or "1"))
+            continue
+        ro = "disabled" in n.attrs or "readonly" in n.attrs
+        if t == "file":
+            notes.append("file uploads are not supported here — use the browser for this question")
+            continue
+        if t in ("radio", "checkbox"):
+            lid = n.attrs.get("aria-labelledby")
+            lab = byid.get(lid) if lid else None
+            if lab is None and n.attrs.get("id"):
+                lab = labfor.get(n.attrs["id"])
+            if lab is not None:
+                drop.add(id(lab))
+            num = lab.find(lambda x: "answernumber" in x.classes) if lab is not None else None
+            key = re.sub(r"[\s.)]+$", "", num.text().strip()).lower() if num is not None else ""
+            clear = n.attrs.get("value") == "-1" or n.ancestor(lambda x: "qtype_multichoice_clearchoice" in x.classes) is not None
+            opt = {"name": name, "value": n.attrs.get("value", "on"), "label": "", "key": key,
+                   "checked": "checked" in n.attrs, "hidden": clear, "result": _result_of(n)}
+            label_nodes.append((opt, lab, n))
+            if t == "radio":
+                f = radios.get(name)
+                if f is None:
+                    f = radios[name] = {"kind": "radio", "name": name, "label": "", "options": [],
+                                        "value": None, "readonly": ro, "result": None}
+                    fields.append(f)
+                    marks[id(n)] = len(fields)
+                f["options"].append(opt)
+                if opt["checked"] and not clear:
+                    f["value"] = opt["value"]
+            else:
+                if fields and fields[-1]["kind"] == "checkbox" and prev == "checkbox":
+                    f = fields[-1]
+                else:
+                    f = {"kind": "checkbox", "name": name, "label": "", "options": [], "readonly": ro, "result": None}
+                    fields.append(f)
+                    marks[id(n)] = len(fields)
+                f["options"].append(opt)
+            f["readonly"] = f["readonly"] or ro
+            prev = t
+            continue
+        kind = "select" if t == "select" else "textarea" if t == "textarea" else "text"
+        f = {"kind": kind, "name": name, "label": "", "readonly": ro, "result": _result_of(n), "_node": n}
+        if kind == "select":
+            opts = [{"value": o.attrs["value"] if "value" in o.attrs else o.text().strip(),
+                     "label": re.sub(r"\s+", " ", o.text()).strip(),
+                     "selected": "selected" in o.attrs} for o in n.iter() if o.tag == "option"]
+            f["options"] = opts
+            sel = next((o for o in opts if o["selected"]), opts[0] if opts else None)
+            f["value"] = sel["value"] if sel else ""
+        elif kind == "textarea":
+            f["value"] = n.text()
+            if f["value"].startswith("\n"):  # browsers drop one leading newline
+                f["value"] = f["value"][1:]
+        else:
+            f["value"] = n.attrs.get("value") or ""
+        fields.append(f)
+        marks[id(n)] = len(fields)
+        prev = t
+
+    images = []
+
+    def tf(n):
+        if n.tag in ("script", "style", "noscript", "button"):
+            return ""
+        if n.classes & QUIZ_HIDE or id(n) in drop:
+            return ""
+        if n.tag == "img":
+            if n.classes & {"icon", "questioncorrectnessicon", "questionflagimage"}:
+                return ""
+            src_ = n.attrs.get("src") or ""
+            if not src_:
+                return ""
+            images.append(src_)
+            alt = (n.attrs.get("alt") or "").strip()
+            return _h.escape(f" [image i{len(images)}{': ' + alt if alt else ''}] ", quote=False)
+        if n.tag in ("input", "select", "textarea"):
+            if _input_type(n) in ("hidden", "radio", "checkbox", "submit", "button", "image", "reset"):
+                return ""
+            k = marks.get(id(n))
+            return f" {QUIZ_MARK.format(k)} " if k else ""
+        return None
+
+    outcome = content.find(lambda n: "outcome" in n.classes)
+    if outcome is not None:
+        drop.add(id(outcome))
+    text = html2text(serialize(content, tf))
+    feedback = ""
+    if outcome is not None:
+        drop.discard(id(outcome))
+        feedback = html2text(serialize(outcome, tf))
+
+    def tf_label(n):
+        return "" if "answernumber" in n.classes else tf(n)
+
+    for opt, lab, inp in label_nodes:
+        if lab is not None:
+            txt = html2text(serialize(lab, tf_label), links=False)
+            opt["label"] = "\n".join(l for l in txt.split("\n") if l.strip())
+        else:
+            opt["label"] = inp.attrs.get("aria-label") or ("?" if opt["hidden"] else opt["value"])
+    for f in fields:
+        n = f.pop("_node", None)
+        if n is None:
+            continue
+        tr = n.ancestor(lambda x: x.tag == "tr", levels=6)
+        if tr is not None:
+            parts = [html2text(serialize(td, tf), links=False).strip() for td in tr.children
+                     if isinstance(td, Node) and td.tag in ("td", "th") and not td.contains(n)]
+            f["label"] = " ".join(p for p in parts if p)
+        if not f["label"] and n.attrs.get("id") in labfor:
+            f["label"] = re.sub(r"\s+", " ", labfor[n.attrs["id"]].text()).strip()
+    hd = dict(hidden)
+    for f in fields:
+        if f["kind"] == "textarea":
+            f["format"] = hd.get(f["name"] + "format")
+    if any(k.endswith("_attachments") for k, _ in hidden):
+        notes.append("file attachments for this question can only be uploaded in the browser")
+    return {"text": text, "feedback": feedback, "fields": fields, "hidden": hidden, "images": images, "notes": notes}
+
+
+def question_data(pq):
+    """The form data a browser would POST for this question (hidden fields + current answers)."""
+    d = dict(pq["hidden"])
+    for f in pq["fields"]:
+        if f["readonly"]:
+            continue
+        if f["kind"] == "radio":
+            if f["value"] is not None:
+                d[f["name"]] = f["value"]
+        elif f["kind"] == "checkbox":
+            for o in f["options"]:
+                if o["checked"]:
+                    d[o["name"]] = o["value"]
+                elif d.get(o["name"]) == o["value"]:
+                    d.pop(o["name"])
+        else:
+            d[f["name"]] = f["value"]
+    return d
+
+
+def select_placeholder(f):
+    o = f["options"][0] if f.get("options") else None
+    return o if o is not None and o["value"] in ("", "0") else None
+
+
+def visible_options(f):
+    if f["kind"] == "select":
+        ph = select_placeholder(f)
+        return [o for o in f["options"] if o is not ph]
+    return [o for o in f["options"] if not o["hidden"]]
+
+
+def field_lines(k, f):
+    titles = {"radio": "Choose one", "checkbox": "Choose one or more", "select": "Choose",
+              "text": "Answer", "textarea": "Answer"}
+    label = (f["label"] or titles[f["kind"]]).split("\n")
+    L = [cyan(QUIZ_MARK.format(k)) + " " + bold(label[0])] + ["    " + x for x in label[1:]]
+    res_mark = {"correct": green(" ✓"), "incorrect": red(" ✗"), "partiallycorrect": yellow(" ~")}
+    if f["kind"] in ("radio", "checkbox", "select"):
+        opts = visible_options(f)
+        keyed = all(o.get("key") for o in opts) and len({o["key"] for o in opts}) == len(opts)
+        for i, o in enumerate(opts, 1):
+            if f["kind"] == "radio":
+                on = f["value"] == o["value"]
+                mark = "●" if on else "○"
+            elif f["kind"] == "checkbox":
+                on = o["checked"]
+                mark = "☑" if on else "☐"
+            else:
+                on = f["value"] == o["value"]
+                mark = "●" if on else "○"
+            lines = (o["label"] or o["value"]).split("\n")
+            res = res_mark.get(o.get("result") or (f.get("result") if on else None), "") if on else ""
+            mk = green(mark) if on else dim(mark)
+            num = o["key"] if keyed else str(i)
+            L.append(f"    {mk} {num:>2}) {lines[0]}{res}")
+            L += ["          " + x for x in lines[1:]]
+    elif f["kind"] == "text":
+        L.append("    " + (f["value"] if f["value"] else dim("(empty)")) + res_mark.get(f.get("result"), ""))
+    else:
+        txt = html2text(f["value"], links=False) if f.get("format") == "1" else f["value"]
+        lines = txt.strip().split("\n") if txt.strip() else []
+        L += ["    │ " + x for x in lines[:12]] or ["    " + dim("(empty)")]
+        if len(lines) > 12:
+            L.append(dim(f"    │ … ({len(lines) - 12} more lines)"))
+    return L
+
+
+def question_lines(meta, pq):
+    num = meta.get("questionnumber") or meta.get("number")
+    title = f"Question {num}" if num not in (None, "", "i") else "Information"
+    extra = []
+    if meta.get("status"):
+        extra.append(meta["status"])
+    if meta.get("mark") not in (None, ""):
+        extra.append(f"mark {meta['mark']} / {meta.get('maxmark')}")
+    elif meta.get("maxmark") not in (None, "") and meta.get("type") != "description":
+        mm = meta["maxmark"]
+        extra.append(f"{mm:g} point{'s' if mm != 1 else ''}" if isinstance(mm, (int, float)) else f"{mm} points")
+    if meta.get("flagged"):
+        extra.append("⚑ flagged")
+    L = [cyan("━" * min(width(), 60)), bold(title) + dim("   " + " · ".join(extra) if extra else "")]
+    if meta.get("blockedbyprevious"):
+        L.append(yellow("(blocked until you answer the previous question)"))
+    if pq["text"]:
+        L += ["", pq["text"]]
+    if pq["images"]:
+        L.append(dim("  " + str(len(pq["images"])) + " image(s) — type i1, i2, … at an answer prompt to open them"))
+    for k, f in enumerate(pq["fields"], 1):
+        L += [""] + field_lines(k, f)
+    if pq.get("feedback"):
+        L += ["", pq["feedback"]]
+    for n in pq["notes"]:
+        L.append(yellow("  note: " + n))
+    return L
+
+
+class QuizTimeUp(Exception):
+    pass
+
+
+def time_left(deadline):
+    if not deadline:
+        return ""
+    s = int(deadline - time.time())
+    if s <= 0:
+        return red("time is up")
+    h, rest = divmod(s, 3600)
+    m_, s_ = divmod(rest, 60)
+    t = f"{h}:{m_:02d}:{s_:02d}" if h else f"{m_}:{s_:02d}"
+    return (red if s < 60 else yellow if s < 300 else green)(f"⏱ {t} left")
+
+
+# --------------------------------------------------------------------------- #
+#  Interactive shell
+# --------------------------------------------------------------------------- #
+
+TAGS = {"resource": ("file", blue), "folder": ("folder", blue), "assign": ("assign", magenta),
+        "forum": ("forum", green), "url": ("link", cyan), "page": ("page", cyan),
+        "quiz": ("quiz", yellow), "book": ("book", cyan), "choice": ("choice", yellow),
+        "feedback": ("feedbk", yellow), "lesson": ("lesson", cyan), "h5pactivity": ("h5p", yellow),
+        "lti": ("extern", dim), "workshop": ("wkshop", magenta), "glossary": ("gloss", cyan),
+        "wiki": ("wiki", cyan), "chat": ("chat", green), "scorm": ("scorm", yellow),
+        "bigbluebuttonbn": ("bbb", green), "data": ("db", cyan)}
+
+HELP = f"""
+{bold('moodle')} — terminal Moodle client
+
+  {cyan('moodle')}            full-screen interface (arrow keys, Enter, Esc — press ? inside)
+  {cyan('moodle shell')}      command prompt (below)
+  {cyan('moodle <command>')}  run one command, e.g.  moodle todo   moodle sync all
+
+{bold('Account')}
+  login [url]            log in with username + password (like the mobile app)
+  login --sso [url]      for sites with Microsoft/Google/SSO login (one-time link)
+  login --token [url]    paste a web service token instead
+  logout                 forget the saved token
+  whoami                 show account / site info
+
+{bold('Courses & files')}           (numbers refer to the last list shown)
+  courses                list all your courses (current, hidden from dashboard, past)
+  move <n...> <group>    regroup courses yourself: current|hidden|past|auto  (e.g. move 1-5 current)
+  course <n|name>        open a course and list its contents
+  show <n>               show an item (file list, page text, forum, assignment...)
+  get <n...|all>         download files of items, e.g. `get 3 5-8`
+  sync [course|all|everything]  download new/changed files (all = not past, everything = incl. past)
+  url <n>                print the web link of an item
+  done <n>               toggle manual completion of an item
+  fetch <url>            download any Moodle file link (shown as [1] links in texts)
+  dir [path]             show/set the download folder
+
+{bold('Deadlines & assignments')}
+  todo                   upcoming deadlines (timeline), overdue first
+  calendar               upcoming calendar events
+  assignments [all] [course]   list assignments (default: not yet past)
+  assignment <n> [get]   details, your submission status, feedback (get: download files)
+  submit <n> FILE...     upload files to an assignment
+  submit <n> --text [T]  submit online text (opens $EDITOR if T is omitted)
+
+{bold('Quizzes')}
+  quizzes [all] [course] list quizzes (default: not closed for more than a week)
+  quiz <n>               details, rules, your attempts and grade
+  quiz <n> start         take the quiz in the terminal (or continue an open attempt)
+  quiz <n> review [k]    your answers + feedback of a finished attempt (default: last)
+
+{bold('Grades')}
+  grades                 overview of all courses
+  grades <course>        grade items of one course
+
+{bold('Communication')}
+  notifications [read]   show notifications (read: mark all as read)
+  messages               list conversations
+  chat <n>               read a conversation and reply interactively
+  write <name>           start a new private message to someone
+  read <n>               read a forum discussion (after `show <forum>`)
+  reply <post> [text]    reply to a post in the open discussion
+  newpost                start a new discussion in the open forum
+
+{bold('Other')}
+  tui                    open the full-screen interface
+  refresh                clear cached data      help <command>   details
+  quit / exit / Ctrl-D
+"""
+
+
+def unquote_path(s):
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "'\"":
+        s = s[1:-1]
+    if s.startswith("file://"):
+        s = urllib.parse.unquote(s[7:])
+    return os.path.expanduser(s)
+
+
+def ask_paths():
+    """Ask for file paths one per line, with Tab completion. Empty line ends."""
+    try:
+        import readline
+    except ImportError:
+        readline = None
+    import glob
+
+    def comp(text, state):
+        t = unquote_path(text) if text else ""
+        hits = [p + ("/" if os.path.isdir(p) else "") for p in sorted(glob.glob(glob.escape(t) + "*"))]
+        return hits[state] if state < len(hits) else None
+
+    if readline:
+        old = (readline.get_completer(), readline.get_completer_delims())
+        readline.set_completer(comp)
+        readline.set_completer_delims("")
+        if "libedit" in (readline.__doc__ or "") or getattr(readline, "backend", "") == "editline":
+            readline.parse_and_bind("bind ^I rl_complete")
+        else:
+            readline.parse_and_bind("tab: complete")
+    paths = []
+    try:
+        while True:
+            try:
+                s = input(f"file {len(paths) + 1}: ")
+            except EOFError:
+                break
+            if not s.strip():
+                break
+            p = Path(unquote_path(s))
+            if not p.is_file():
+                err(f"not a file: {p}")
+                continue
+            paths.append(p)
+    finally:
+        if readline:
+            readline.set_completer(old[0])
+            readline.set_completer_delims(old[1])
+    return paths
+
+
+class Shell(cmd.Cmd):
+    doc_header = "Commands (type help <command>):"
+
+    def __init__(self):
+        super().__init__()
+        self.cfg = load_config()
+        self.m = Moodle(self.cfg["url"], self.cfg.get("token")) if self.cfg.get("url") else None
+        self._courses = None
+        self.course = None
+        self.sections, self.modules = [], []
+        self.assigns, self.convs, self.discussions, self.posts = [], [], [], []
+        self.quizzes = []
+        self.forum = self.discussion = None
+        self.update_prompt()
+
+    # -- plumbing ----------------------------------------------------------- #
+    def update_prompt(self):
+        where = self.course["shortname"] if self.course else ""
+        self.prompt = (f"\001\033[1;36m\002moodle\001\033[0m\002{':' + where if where else ''}> "
+                       if USE_COLOR else f"moodle{':' + where if where else ''}> ")
+
+    def onecmd(self, line):
+        try:
+            return super().onecmd(line)
+        except MoodleError as e:
+            err(e)
+        except KeyboardInterrupt:
+            print()
+        except (BrokenPipeError, EOFError):
+            pass
+        return False
+
+    def emptyline(self):
+        return False
+
+    def default(self, line):
+        err(f"unknown command: {line.split()[0]}  (type `help`)")
+
+    def do_help(self, arg):
+        if arg:
+            return super().do_help(arg)
+        page(HELP.strip())
+
+    def do_quit(self, arg):
+        """Leave the program."""
+        return True
+
+    do_exit = do_quit
+
+    def do_EOF(self, arg):
+        print()
+        return True
+
+    def do_tui(self, arg):
+        """Open the full-screen interface."""
+        run_tui(self)
+
+    @property
+    def uid(self):
+        return self.cfg.get("userid")
+
+    @property
+    def logged_in(self):
+        return bool(self.m and self.m.token)
+
+    def need(self):
+        if not self.logged_in:
+            raise MoodleError("not logged in — run `login`")
+        return self.m
+
+    def dl_dir(self):
+        return Path(os.path.expanduser(self.cfg.get("download_dir") or DEFAULT_DL))
+
+    # -- account ------------------------------------------------------------ #
+    def do_login(self, arg):
+        """login [--sso|--token] [url]  — log in (password is never stored, only the app token)."""
+        a = args_of(arg)
+        mode = "sso" if "--sso" in a else "token" if "--token" in a else "password"
+        rest = [x for x in a if not x.startswith("--")]
+        url = rest[0] if rest else input(f"Moodle site URL{' [' + self.cfg['url'] + ']' if self.cfg.get('url') else ''}: ").strip() or self.cfg.get("url", "")
+        if not url:
+            raise MoodleError("no URL given")
+        m = Moodle(url)
+        try:
+            pub = m.public_config()
+            m.url = normalize_url(pub.get("httpswwwroot") or pub.get("wwwroot") or m.url)
+            print(f"Site: {bold(html2text(pub.get('sitename', ''), links=False))}  {dim(m.url)}")
+            if mode == "password" and pub.get("typeoflogin") in (2, 3):
+                print(yellow("This site sends app logins through a browser page (SSO)."))
+                print("  1) try username + password anyway\n  2) SSO one-time link (open it on your phone or any device)\n  3) paste a token")
+                choice = input("choose [2]: ").strip() or "2"
+                mode = {"1": "password", "3": "token"}.get(choice, "sso")
+        except MoodleError:
+            info(f"(could not read public site info from {m.url} — continuing)")
+
+        if mode == "password":
+            user = input("Username: ").strip()
+            pw = getpass.getpass("Password: ")
+            m.login(user, pw)
+        elif mode == "token":
+            print(dim("Token from: Moodle > Preferences > Security keys (service 'Moodle mobile web service')."))
+            m.token = getpass.getpass("Token: ").strip()
+        else:
+            self._sso(m)
+
+        si = m.call("core_webservice_get_site_info")
+        self.cfg.update(url=m.url, token=m.token, userid=si["userid"], fullname=si.get("fullname"),
+                        sitename=si.get("sitename"), release=si.get("release"))
+        save_config(self.cfg)
+        self.m = m
+        self._courses = None
+        print(green("✓ ") + f"logged in as {bold(si.get('fullname'))} on {si.get('sitename')}")
+        info(f"token saved to {CONFIG_FILE} (mode 600)")
+
+    def _sso(self, m):
+        passport = f"{random.random() * 1000:.6f}"
+        link = (f"{m.url}/admin/tool/mobile/launch.php?service={SERVICE}"
+                f"&passport={passport}&urlscheme=moodlemobile")
+        print(textwrap.dedent(f"""
+            {bold('SSO login')} — your site logs in through a web page, so this step needs
+            a browser ONCE, on any device (your phone is fine). Nothing is read from it.
+
+              1. Open this link and log in:
+                 {cyan(link)}
+              2. At the end it tries to open the Moodle app with an address that starts
+                 with  {bold('moodlemobile://token=')}  — copy that address
+                 (from the address bar, the error page, or the "open app" button's link).
+              3. Paste it here.
+            """))
+        s = input("moodlemobile:// link: ").strip()
+        mt = re.search(r"token=([A-Za-z0-9+/=_-]+)", s)
+        if not mt:
+            raise MoodleError("that does not contain token=...")
+        b64 = mt.group(1).replace("-", "+").replace("_", "/")
+        try:
+            data = base64.b64decode(b64 + "=" * (-len(b64) % 4)).decode()
+        except Exception:
+            raise MoodleError("could not decode the token link")
+        parts = data.split(":::")
+        if len(parts) < 2:
+            raise MoodleError("unexpected token format")
+        sig = parts[0]
+        ok = any(hashlib.md5((u + passport).encode()).hexdigest() == sig
+                 for u in (m.url, m.url.replace("https://", "http://")))
+        if not ok:
+            print(yellow("warning: signature did not match this login attempt (old link?). Trying anyway."))
+        m.token = parts[1]
+
+    def do_logout(self, arg):
+        """Forget the saved token."""
+        for k in ("token", "userid", "fullname"):
+            self.cfg.pop(k, None)
+        save_config(self.cfg)
+        if self.m:
+            self.m.token = None
+        print("logged out (token removed from this computer).")
+
+    def do_whoami(self, arg):
+        """Show account and site information."""
+        si = self.need().call("core_webservice_get_site_info")
+        print(f"{bold(si.get('fullname'))} ({si.get('username')}, id {si.get('userid')})")
+        print(f"{si.get('sitename')}  {dim(self.m.url)}")
+        print(dim(f"Moodle {si.get('release', '?')}  ·  config: {CONFIG_FILE}  ·  downloads: {self.dl_dir()}"))
+
+    def do_dir(self, arg):
+        """dir [path]  — show or set the download folder."""
+        if arg.strip():
+            p = Path(os.path.expanduser(arg.strip())).resolve()
+            self.cfg["download_dir"] = str(p)
+            save_config(self.cfg)
+        print(self.dl_dir())
+
+    def do_refresh(self, arg):
+        """Clear cached lists (courses etc.)."""
+        self._courses = None
+        if self.course:
+            self.load_course(self.course)
+        print("cache cleared.")
+
+    # -- courses ------------------------------------------------------------ #
+    @staticmethod
+    def is_past(c):
+        return bool(c.get("enddate")) and c["enddate"] < time.time()
+
+    GROUPS = ("current", "hidden", "past")
+
+    def course_group(self, c):
+        """0 = current, 1 = hidden from dashboard, 2 = past (your own `move` choice wins)"""
+        ov = self.cfg.get("course_groups", {}).get(str(c["id"]))
+        if ov in self.GROUPS:
+            return self.GROUPS.index(ov)
+        if self.is_past(c):
+            return 2
+        if c.get("hidden"):
+            return 1
+        return 0
+
+    def courses(self, refresh=False):
+        if self._courses is None or refresh:
+            self._courses = self.need().call("core_enrol_get_users_courses", userid=self.uid)
+            self.sort_courses()
+        return self._courses
+
+    def sort_courses(self):
+        if self._courses is not None:
+            self._courses = sorted(self._courses, key=lambda c: (self.course_group(c), not c.get("isfavourite"),
+                                                      (c.get("fullname") or "").lower()))
+
+    def set_group(self, courses, target):
+        """target: current|hidden|past|auto — stored only on this computer."""
+        ov = self.cfg.setdefault("course_groups", {})
+        for c in courses:
+            if target == "auto":
+                ov.pop(str(c["id"]), None)
+            else:
+                ov[str(c["id"])] = target
+        save_config(self.cfg)
+        self.sort_courses()
+
+    def do_move(self, arg):
+        """move <n...> current|hidden|past|auto  — choose where courses are listed, e.g. `move 1-5 current`.
+        Only changes this program (saved in your config), not the Moodle website. `auto` undoes it."""
+        a = args_of(arg)
+        targets = self.GROUPS + ("auto",)
+        if len(a) < 2 or a[-1] not in targets:
+            raise MoodleError("usage: move <n...> current|hidden|past|auto   e.g.  move 1-5 current")
+        cs = self.courses()
+        chosen = [cs[n - 1] for n in parse_nums(a[:-1], len(cs))]
+        self.set_group(chosen, a[-1])
+        print(green("✓ ") + f"{len(chosen)} course(s) → {a[-1]}   (numbers may have changed:)\n")
+        self.do_courses("", refresh=False)
+
+    def course_groups(self):
+        groups = [("Current courses", []), ("Hidden from your dashboard", []), ("Past courses", [])]
+        for i, c in enumerate(self.courses(), 1):
+            groups[self.course_group(c)][1].append((i, c))
+        return groups
+
+    def course_line(self, i, c):
+        star = yellow("★ ") if c.get("isfavourite") else "  "
+        prog = c.get("progress")
+        prog = dim(f"{prog:.0f}%") if isinstance(prog, (int, float)) else ""
+        name = html2text(c.get("fullname"), links=False)
+        group = self.course_group(c)
+        why = ""
+        if str(c["id"]) in self.cfg.get("course_groups", {}):
+            why = dim("  (moved by you)")
+        elif group == 2 and c.get("enddate"):
+            why = dim(f"  (end date {datetime.fromtimestamp(c['enddate']).strftime('%d.%m.%Y')})")
+        return f"[{i:>3}] {star}{dim(name) if group else bold(name)}  {dim(c.get('shortname', ''))} {prog}{why}"
+
+    def find_course(self, arg, required=True):
+        arg = (arg or "").strip()
+        if not arg:
+            if self.course:
+                return self.course
+            if self.cfg.get("last_course"):
+                c = next((c for c in self.courses() if c["id"] == self.cfg["last_course"]), None)
+                if c:
+                    return c
+            if required:
+                raise MoodleError("which course? (see `courses`)")
+            return None
+        cs = self.courses()
+        if arg.isdigit():
+            n = int(arg)
+            if 1 <= n <= len(cs):
+                return cs[n - 1]
+            raise MoodleError(f"no course number {n}")
+        if arg.startswith("#") and arg[1:].isdigit():
+            c = next((c for c in cs if c["id"] == int(arg[1:])), None)
+            if c:
+                return c
+            raise MoodleError(f"no course with id {arg[1:]}")
+        q = arg.lower()
+        hits = [c for c in cs if q in (c.get("shortname") or "").lower() or q in (c.get("fullname") or "").lower()]
+        if len(hits) == 1:
+            return hits[0]
+        exact = [c for c in hits if (c.get("shortname") or "").lower() == q]
+        if len(exact) == 1:
+            return exact[0]
+        if not hits:
+            raise MoodleError(f"no course matches '{arg}'")
+        raise MoodleError(f"'{arg}' matches several courses: " + ", ".join(c["shortname"] for c in hits[:6]))
+
+    def do_courses(self, arg, refresh=True):
+        """courses  — list all your courses (current, hidden from dashboard, past)."""
+        self.courses(refresh=refresh)
+        L = []
+        for title, items in self.course_groups():
+            if not items:
+                continue
+            if L:
+                L.append("")
+            L.append(cyan(bold(f"{title} ({len(items)})")))
+            L += [self.course_line(i, c) for i, c in items]
+        if L:
+            L.append(dim("\n  open: course <n>     regroup: move <n...> current|hidden|past|auto"))
+        page("\n".join(L) if L else "You are not enrolled in any courses.")
+
+    def course_modules(self, c):
+        sections = self.need().call("core_course_get_contents", courseid=c["id"])
+        mods = []
+        for sec in sections:
+            for mod in sec.get("modules", []):
+                if mod.get("modname") == "label":
+                    continue
+                mod["_section"] = sec.get("name") or f"Section {sec.get('section')}"
+                mods.append(mod)
+        return sections, mods
+
+    def load_course(self, c):
+        self.sections, self.modules = self.course_modules(c)
+        self.course = c
+        if self.cfg.get("last_course") != c["id"]:
+            self.cfg["last_course"] = c["id"]
+            save_config(self.cfg)
+        self.update_prompt()
+
+    def ensure_modules(self):
+        if not self.modules:
+            self.load_course(self.find_course(""))
+        return self.modules
+
+    def get_mod(self, arg):
+        mods = self.ensure_modules()
+        a = args_of(arg)
+        if not a:
+            raise MoodleError("which item number?")
+        return mods[parse_nums(a[:1], len(mods))[0] - 1]
+
+    def course_rows(self, sections, header_course=None):
+        """[(text, module-or-None)] for a course page."""
+        rows = []
+        if header_course:
+            c = header_course
+            rows.append((bold(html2text(c["fullname"], links=False)) + dim(f"   {c['shortname']} · id {c['id']}"), None))
+        n = 0
+        for sec in sections:
+            mods = sec.get("modules", [])
+            if not mods and not html2text(sec.get("summary"), links=False):
+                continue
+            if rows:
+                rows.append(("", None))
+            rows.append((cyan(bold("▌" + (sec.get("name") or f"Section {sec.get('section')}"))), None))
+            summ = html2text(sec.get("summary"), links=False)
+            if summ:
+                lines = summ.splitlines()
+                rows += [(dim("  " + x), None) for x in lines[:3]] + ([(dim("  …"), None)] if len(lines) > 3 else [])
+            for mod in mods:
+                if mod.get("modname") == "label":
+                    t = html2text(mod.get("description"), links=False).replace("\n", " ").strip()
+                    if t:
+                        rows.append((dim("        " + (t[:width() - 12] + "…" if len(t) > width() - 11 else t)), None))
+                    continue
+                n += 1
+                rows.append((self.mod_line(n, mod), mod))
+        return rows
+
+    def do_course(self, arg):
+        """course <n|shortname|#id>  — open a course and list its contents."""
+        c = self.find_course(arg)
+        self.load_course(c)
+        page("\n".join(t for t, _ in self.course_rows(self.sections, header_course=c)))
+
+    def mod_line(self, n, mod):
+        tag, col = TAGS.get(mod["modname"], (mod["modname"][:6], dim))
+        name = html2text(mod.get("name"), links=False)
+        extra = ""
+        files = [f for f in mod.get("contents") or [] if f.get("type") == "file"]
+        if mod["modname"] == "resource" and files:
+            ext = Path(files[0]["filename"]).suffix.lstrip(".")
+            extra = dim(f"  {ext} {human(files[0].get('filesize'))}")
+        elif mod["modname"] == "folder" and files:
+            extra = dim(f"  {len(files)} files")
+        state = (mod.get("completiondata") or {}).get("state")
+        done = green(" ✓") if state in (1, 2) else red(" ✗") if state == 3 else ""
+        if not mod.get("uservisible", True):
+            name = dim(name + " (locked)")
+        return f"  [{n:>3}] {col(f'{tag:<6}')} {name}{extra}{done}"
+
+    def mod_lines(self, mod, hints=True):
+        kind = mod["modname"]
+        L = [bold(html2text(mod["name"], links=False)) + dim(f"   ({mod.get('modplural', kind)} · {mod.get('_section', '')})")]
+        if not mod.get("uservisible", True):
+            L.append(yellow("Not available yet: ") + html2text(mod.get("availabilityinfo"), links=False))
+        for d in mod.get("dates") or []:
+            L.append(f"{d.get('label')} {fmt_time(d.get('timestamp'))}  {dim(rel(d.get('timestamp')))}")
+        if mod.get("description"):
+            L += ["", html2text(mod["description"])]
+        if kind in ("page", "book"):
+            for f in mod.get("contents") or []:
+                if f.get("filename", "").endswith((".html", ".htm")):
+                    L += ["", html2text(self.need().fetch(f["fileurl"]).decode("utf-8", "replace"))]
+        elif kind == "url":
+            for f in mod.get("contents") or []:
+                L += ["", "Link: " + cyan(f.get("fileurl", ""))]
+        files = [f for f in mod.get("contents") or [] if f.get("type") == "file" and kind not in ("page", "book")]
+        if files:
+            L += ["", bold("Files:")]
+            for f in files:
+                L.append(f"  {(f.get('filepath') or '/').lstrip('/')}{f['filename']}  {dim(human(f.get('filesize')))}  "
+                         f"{dim(fmt_time(f.get('timemodified')))}")
+            if hints and mod in self.modules:
+                L.append(dim(f"\n  download with: get {self.modules.index(mod) + 1}"))
+        if kind not in ("resource", "folder", "page", "book", "url", "label"):
+            L += ["", dim("web: " + mod.get("url", ""))]
+        return L
+
+    def do_show(self, arg):
+        """show <n>  — show an item of the current course."""
+        mod = self.get_mod(arg)
+        kind = mod["modname"]
+        if kind == "assign":
+            self.load_assigns(self.course)
+            a = next((x for x in self.assigns if x.get("cmid") == mod["id"]), None)
+            if a:
+                return self.show_assignment(a)
+        if kind == "forum":
+            print(bold(html2text(mod["name"], links=False)))
+            return self.show_forum(mod)
+        if kind == "quiz" and mod.get("uservisible", True):
+            return self.show_quiz(self.find_quiz(cmid=mod["id"], course=self.course))
+        page("\n".join(self.mod_lines(mod)))
+
+    def do_url(self, arg):
+        """url <n>  — print the web address of an item."""
+        mod = self.get_mod(arg)
+        print(mod.get("url") or "")
+        if mod["modname"] == "url":
+            for f in mod.get("contents") or []:
+                print(f.get("fileurl"))
+
+    def toggle_done(self, mod):
+        state = (mod.get("completiondata") or {}).get("state", 0)
+        new = 0 if state in (1, 2) else 1
+        res = self.need().call("core_completion_update_activity_completion_status_manually", cmid=mod["id"], completed=new)
+        if not res.get("status"):
+            raise MoodleError("could not change completion (it may be automatic)")
+        mod.setdefault("completiondata", {})["state"] = new
+        return new
+
+    def do_done(self, arg):
+        """done <n>  — toggle manual completion of an item."""
+        mod = self.get_mod(arg)
+        new = self.toggle_done(mod)
+        print(("marked done ✓ " if new else "marked not done ") + mod["name"])
+
+    # -- downloading -------------------------------------------------------- #
+    def mod_files(self, mod, course):
+        """[(fileinfo, destination path)] for a module."""
+        out = []
+        base = self.dl_dir() / safe_name(course["shortname"]) / safe_name(mod.get("_section", ""))
+        if mod["modname"] in ("url", "label", "forum"):
+            return out
+        files = [f for f in mod.get("contents") or [] if f.get("type") == "file" and f.get("fileurl")]
+        if mod["modname"] in ("page", "book") or (mod["modname"] != "resource" and len(files) > 1) or mod["modname"] == "folder":
+            base = base / safe_name(mod["name"])
+        for f in files:
+            sub = [safe_name(p) for p in (f.get("filepath") or "/").strip("/").split("/") if p]
+            out.append((f, base.joinpath(*sub, safe_name(f["filename"], 180))))
+        return out
+
+    @staticmethod
+    def up_to_date(f, dest):
+        t = f.get("timemodified") or 0
+        return dest.exists() and dest.stat().st_size == (f.get("filesize") or -1) and \
+            (not t or abs(dest.stat().st_mtime - t) < 2)
+
+    def fetch_files(self, pairs, force=False, log=print, show=True):
+        got = skipped = 0
+        for f, dest in pairs:
+            if not force and self.up_to_date(f, dest):
+                skipped += 1
+                continue
+            shown = dest.relative_to(self.dl_dir()) if self.dl_dir() in dest.parents else dest
+            log(f"  ↓ {shown}  {dim(human(f.get('filesize')))}")
+            try:
+                self.m.download(f["fileurl"], dest, mtime=f.get("timemodified") or None, show=show)
+                got += 1
+            except MoodleError as e:
+                log(red(f"  {f['filename']}: {e}"))
+        return got, skipped
+
+    def do_get(self, arg):
+        """get <n...|all>  — download the files of items, e.g. `get 2 4-6`."""
+        mods = self.ensure_modules()
+        nums = parse_nums(args_of(arg) or ["?"], len(mods))
+        pairs = []
+        for n in nums:
+            pairs += self.mod_files(mods[n - 1], self.course)
+        if not pairs:
+            return print("nothing to download (no files in those items).")
+        got, skipped = self.fetch_files(pairs, force=len(nums) == 1)
+        print(green("✓ ") + f"{got} downloaded, {skipped} already up to date  →  {self.dl_dir() / safe_name(self.course['shortname'])}")
+
+    def sync_course(self, c, log=print, show=True):
+        _, mods = self.course_modules(c)
+        pairs = []
+        for mod in mods:
+            if mod["modname"] in ("resource", "folder"):
+                pairs += self.mod_files(mod, c)
+        return self.fetch_files(pairs, log=log, show=show)
+
+    def do_sync(self, arg):
+        """sync [course|all|everything]  — download new/changed files. all = every course that is not past."""
+        a = arg.strip()
+        if a in ("all", "everything"):
+            targets = [c for c in self.courses() if a == "everything" or self.course_group(c) < 2]
+        else:
+            targets = [self.find_course(a)]
+        total = [0, 0]
+        for c in targets:
+            print(bold(c["shortname"]))
+            got, skipped = self.sync_course(c)
+            total[0] += got
+            total[1] += skipped
+        print(green("✓ ") + f"{total[0]} downloaded, {total[1]} already up to date  →  {self.dl_dir()}")
+
+    def do_fetch(self, arg):
+        """fetch <url> [dest]  — download any Moodle file link with your token."""
+        a = args_of(arg)
+        if not a:
+            raise MoodleError("usage: fetch <url> [destination]")
+        url = a[0]
+        name = urllib.parse.unquote(url.split("?")[0].rstrip("/").split("/")[-1]) or "download"
+        dest = Path(os.path.expanduser(a[1])) if len(a) > 1 else self.dl_dir() / "downloads" / safe_name(name, 180)
+        if dest.is_dir():
+            dest = dest / safe_name(name, 180)
+        n = self.need().download(url, dest)
+        print(green("✓ ") + f"{dest}  {dim(human(n))}")
+
+    # -- deadlines ---------------------------------------------------------- #
+    def todo_rows(self):
+        now = int(time.time())
+        res = self.need().call("core_calendar_get_action_events_by_timesort",
+                               timesortfrom=now - 14 * 86400, limitnum=50)
+        evs = sorted(res.get("events", []), key=lambda e: e.get("timesort") or e.get("timestart") or 0)
+        rows, last_day = [], None
+        for e in evs:
+            ts = e.get("timesort") or e.get("timestart")
+            day = "Overdue" if ts < now else datetime.fromtimestamp(ts).strftime("%A, %d %B")
+            if day != last_day:
+                if rows:
+                    rows.append(("", None))
+                rows.append((red(bold(day)) if day == "Overdue" else bold(day), None))
+                last_day = day
+            course = (e.get("course") or {}).get("shortname", "")
+            action = (e.get("action") or {}).get("name", "")
+            rows.append((f"  {due_color(ts, datetime.fromtimestamp(ts).strftime('%H:%M'))}  {html2text(e.get('name'), links=False)}"
+                         f"  {dim(course)}  {dim('· ' + action if action else '')}  {dim(rel(ts))}", e))
+        return rows
+
+    def event_lines(self, e):
+        ts = e.get("timesort") or e.get("timestart")
+        L = [bold(html2text(e.get("name"), links=False)),
+             f"{due_color(ts, fmt_time(ts))}  {dim(rel(ts))}"]
+        if e.get("course"):
+            L.append(dim(html2text(e["course"].get("fullname"), links=False)))
+        if e.get("location"):
+            L.append("Location: " + e["location"])
+        if e.get("description"):
+            L += ["", html2text(e["description"])]
+        url = (e.get("action") or {}).get("url") or e.get("url")
+        if url:
+            L += ["", dim("web: " + url)]
+        return L
+
+    def do_todo(self, arg):
+        """todo  — upcoming deadlines and things to do (overdue first)."""
+        rows = self.todo_rows()
+        page("\n".join(t for t, _ in rows) if rows else green("Nothing to do."))
+
+    def calendar_rows(self):
+        res = self.need().call("core_calendar_get_calendar_upcoming_view")
+        rows = []
+        for e in res.get("events", []):
+            ts = e.get("timestart")
+            course = (e.get("course") or {}).get("shortname", "")
+            rows.append((f"{bold(fmt_time(ts))}  {html2text(e.get('name'), links=False)}  {dim(course)}  {dim(rel(ts))}", e))
+            if e.get("location"):
+                rows.append((dim(f"      @ {e['location']}"), None))
+        return rows
+
+    def do_calendar(self, arg):
+        """calendar  — upcoming calendar events."""
+        rows = self.calendar_rows()
+        page("\n".join(t for t, _ in rows) if rows else "No upcoming events.")
+
+    # -- assignments -------------------------------------------------------- #
+    def load_assigns(self, course=None):
+        res = self.need().call("mod_assign_get_assignments", courseids=[course["id"]] if course else [])
+        out = []
+        for c in res.get("courses", []):
+            for a in c.get("assignments", []):
+                a["_course"] = c
+                out.append(a)
+        out.sort(key=lambda a: (a.get("duedate") or 10 ** 12, a.get("name", "")))
+        self.assigns = out
+        return out
+
+    def find_assign(self, cmid=None, instance=None, course=None):
+        for x in self.load_assigns(course):
+            if (cmid and x.get("cmid") == cmid) or (instance and x.get("id") == instance):
+                return x
+        raise MoodleError("assignment not found (maybe not visible to you yet)")
+
+    def get_assign(self, tok):
+        if not self.assigns:
+            self.load_assigns()
+        return self.assigns[parse_nums([tok], len(self.assigns))[0] - 1]
+
+    def assignment_rows(self, items, show_all=False):
+        now = time.time()
+        rows, hidden = [], 0
+        for i, x in enumerate(items, 1):
+            due = x.get("duedate") or 0
+            if not show_all and due and due < now - 7 * 86400:
+                hidden += 1
+                continue
+            when = due_color(due, fmt_time(due)) if due else dim("no due date          ")
+            rows.append((f"[{i:>3}] {when}  {bold(html2text(x['name'], links=False))}  {dim(x['_course'].get('shortname', ''))}  {dim(rel(due))}", x))
+        return rows, hidden
+
+    def do_assignments(self, arg):
+        """assignments [all] [course]  — list assignments sorted by due date."""
+        a = args_of(arg)
+        show_all = "all" in a
+        rest = " ".join(x for x in a if x != "all")
+        course = self.find_course(rest) if rest else None
+        items = self.load_assigns(course)
+        rows, hidden = self.assignment_rows(items, show_all)
+        L = [t for t, _ in rows]
+        if hidden:
+            L.append(dim(f"\n  ({hidden} older assignments hidden — `assignments all`)"))
+        L.append(dim("\n  details: assignment <n>     upload: submit <n> FILE..."))
+        page("\n".join(L) if items else "No assignments.")
+
+    def do_assignment(self, arg):
+        """assignment <n> [get]  — details, submission status and feedback."""
+        a = args_of(arg)
+        if not a:
+            raise MoodleError("usage: assignment <n> [get]")
+        x = self.get_assign(a[0])
+        if len(a) > 1 and a[1] == "get":
+            got, base = self.get_assignment_files(x)
+            return print(green("✓ ") + f"{got} files → {base}")
+        self.show_assignment(x)
+
+    def submission_status(self, x):
+        return self.need().call("mod_assign_get_submission_status", assignid=x["id"])
+
+    def assignment_lines(self, x, hints=True):
+        L = [bold(html2text(x["name"], links=False)) + dim(f"   {x['_course'].get('fullname', '')}")]
+        for label, key in (("Opens", "allowsubmissionsfromdate"), ("Due", "duedate"), ("Cut-off", "cutoffdate")):
+            if x.get(key):
+                L.append(f"{label + ':':9}{due_color(x[key], fmt_time(x[key]))}  {dim(rel(x[key]))}")
+        if x.get("intro"):
+            L += ["", html2text(x["intro"])]
+        att = x.get("introattachments") or []
+        if att:
+            L += ["", bold("Attachments:")] + [f"  {f['filename']}  {dim(human(f.get('filesize')))}" for f in att]
+        try:
+            st = self.submission_status(x)
+        except MoodleError as e:
+            return L + ["", dim(f"(submission status unavailable: {e})")]
+        last = st.get("lastattempt") or {}
+        sub = last.get("submission") or last.get("teamsubmission") or {}
+        status = sub.get("status", "new")
+        scol = green if status == "submitted" else yellow if status == "draft" else red
+        L += ["", f"{bold('Submission:')} {scol(status)}   grading: {last.get('gradingstatus', '-')}"
+                  + (f"   last change {fmt_time(sub.get('timemodified'))}" if sub.get("timemodified") else "")]
+        for p in sub.get("plugins") or []:
+            for fa in p.get("fileareas") or []:
+                for f in fa.get("files") or []:
+                    L.append(f"  * {f.get('filename')}  {dim(human(f.get('filesize')))}")
+            for ef in p.get("editorfields") or []:
+                if ef.get("text") and p.get("type") == "onlinetext":
+                    L.append(html2text(ef["text"], indent="  │ "))
+        if x.get("submissiondrafts") and status == "draft":
+            L.append(yellow("  Draft only — not yet submitted for grading."))
+        fb = st.get("feedback")
+        if fb:
+            L += ["", bold("Feedback:") + "  " + (html2text(fb.get("gradefordisplay"), links=False) or "-")]
+            if fb.get("gradeddate"):
+                L.append(dim(f"  graded {fmt_time(fb['gradeddate'])}"))
+            for p in fb.get("plugins") or []:
+                for ef in p.get("editorfields") or []:
+                    if ef.get("text"):
+                        L.append(html2text(ef["text"], indent="  │ "))
+                for fa in p.get("fileareas") or []:
+                    for f in fa.get("files") or []:
+                        L.append(f"  feedback file: {f.get('filename')}")
+        if hints:
+            n = self.assigns.index(x) + 1 if x in self.assigns else "?"
+            L.append(dim(f"\n  submit {n} FILE...  |  submit {n} --text  |  assignment {n} get  (download all files)"))
+        return L
+
+    def show_assignment(self, x):
+        page("\n".join(self.assignment_lines(x)))
+
+    def get_assignment_files(self, x, log=print, show=True):
+        base = self.dl_dir() / safe_name(x["_course"].get("shortname")) / "Assignments" / safe_name(x["name"])
+        pairs = [(f, base / safe_name(f["filename"], 180)) for f in x.get("introattachments") or []]
+        st = self.submission_status(x)
+        sub = (st.get("lastattempt") or {}).get("submission") or {}
+        for p in sub.get("plugins") or []:
+            for fa in p.get("fileareas") or []:
+                pairs += [(f, base / "my submission" / safe_name(f["filename"], 180)) for f in fa.get("files") or []]
+        for p in (st.get("feedback") or {}).get("plugins") or []:
+            for fa in p.get("fileareas") or []:
+                pairs += [(f, base / "feedback" / safe_name(f["filename"], 180)) for f in fa.get("files") or []]
+        pairs = [(f, d) for f, d in pairs if f.get("fileurl")]
+        got, _ = self.fetch_files(pairs, force=True, log=log, show=show)
+        return got, base
+
+    def do_submit(self, arg):
+        """submit <n> FILE... | submit <n> --text ["text"]  — submit to an assignment."""
+        a = args_of(arg)
+        if not a:
+            raise MoodleError("usage: submit <n> FILE...   or   submit <n> --text [\"text\"]")
+        x = self.get_assign(a[0])
+        rest = a[1:]
+        text = None
+        if "--text" in rest:
+            i = rest.index("--text")
+            text = " ".join(rest[i + 1:]) if rest[i + 1:] else None
+            files = rest[:i]
+            if text is None:
+                text = edit_text()
+                if not text:
+                    return print("cancelled (empty text).")
+        else:
+            files = rest
+        paths = [Path(os.path.expanduser(f)) for f in files]
+        self.submit(x, paths, text)
+
+    def submit(self, x, paths, text):
+        for p in paths:
+            if not p.is_file():
+                raise MoodleError(f"file not found: {p}")
+        if not paths and text is None:
+            raise MoodleError("give at least one file or --text")
+
+        st = self.submission_status(x)
+        last = st.get("lastattempt") or {}
+        sub = last.get("submission") or last.get("teamsubmission") or {}
+        enabled = {p.get("type") for p in sub.get("plugins") or []}
+        if paths and "file" not in enabled:
+            raise MoodleError("this assignment does not accept file submissions")
+        if text is not None and "onlinetext" not in enabled:
+            raise MoodleError("this assignment does not accept online text")
+        if not last.get("caneditowner", True) or last.get("locked"):
+            raise MoodleError("submissions are locked or closed for you")
+
+        old_files, old_text = [], None
+        for p in sub.get("plugins") or []:
+            if p.get("type") == "file":
+                for fa in p.get("fileareas") or []:
+                    old_files += fa.get("files") or []
+            if p.get("type") == "onlinetext":
+                for ef in p.get("editorfields") or []:
+                    old_text = ef.get("text") or None
+
+        print(bold(x["name"]) + dim(f"  ({x['_course'].get('shortname')})"))
+        if paths:
+            print("Upload: " + ", ".join(f"{p.name} ({human(p.stat().st_size)})" for p in paths))
+            if old_files:
+                print(yellow("This REPLACES your current files: ") + ", ".join(f["filename"] for f in old_files))
+        if text is not None:
+            print("Online text: " + (text[:200] + "…" if len(text) > 200 else text))
+        if not confirm("Save this submission?"):
+            return print("cancelled.")
+
+        plugindata = {}
+        if "file" in enabled:
+            upload = paths
+            tmpdir = None
+            if not paths and old_files:  # keep existing files when only the text changes
+                tmpdir = Path(tempfile.mkdtemp(prefix="moodle-"))
+                upload = []
+                for f in old_files:
+                    d = tmpdir / safe_name(f["filename"], 180)
+                    self.m.download(f["fileurl"], d, show=False)
+                    upload.append(d)
+            if upload:
+                print(dim("uploading…"))
+                plugindata["files_filemanager"] = self.m.upload(upload)
+            if tmpdir:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+        if "onlinetext" in enabled:
+            body = text_to_html(text) if text is not None else old_text
+            if body is not None:
+                try:
+                    item = self.m.call("core_files_get_unused_draft_itemid").get("itemid", 0)
+                except MoodleError:
+                    item = 0
+                plugindata["onlinetext_editor"] = {"text": body, "format": 1, "itemid": item}
+
+        warnings = self.m.call("mod_assign_save_submission", assignmentid=x["id"], plugindata=plugindata)
+        for w in warnings or []:
+            err(w.get("message") or w)
+        if warnings:
+            return
+        print(green("✓ saved."))
+
+        if x.get("submissiondrafts"):
+            statement = html2text(x.get("submissionstatement"), links=False) if x.get("requiresubmissionstatement") else ""
+            if statement:
+                print("\n" + statement + "\n")
+            q = "Submit for grading now? You usually can't change it afterwards." + (" (accepts the statement above)" if statement else "")
+            if confirm(q):
+                warnings = self.m.call("mod_assign_submit_for_grading", assignmentid=x["id"],
+                                       acceptsubmissionstatement=1 if statement else 0)
+                for w in warnings or []:
+                    err(w.get("message") or w)
+                if not warnings:
+                    print(green("✓ submitted for grading."))
+            else:
+                print(yellow("Left as draft.") + " Submit again later to finalise it.")
+
+    # -- quizzes ------------------------------------------------------------ #
+    def load_quizzes(self, course=None):
+        res = self.need().call("mod_quiz_get_quizzes_by_courses", courseids=[course["id"]] if course else [])
+        byid = {c["id"]: c for c in self.courses()}
+        out = []
+        for q in res.get("quizzes", []):
+            q["_course"] = byid.get(q.get("course")) or {"id": q.get("course"), "shortname": "", "fullname": ""}
+            out.append(q)
+        out.sort(key=lambda q: (q.get("timeclose") or 10 ** 12, q.get("name", "")))
+        self.quizzes = out
+        return out
+
+    def find_quiz(self, cmid=None, instance=None, course=None):
+        for q in self.load_quizzes(course):
+            if (cmid and q.get("coursemodule") == cmid) or (instance and q.get("id") == instance):
+                return q
+        raise MoodleError("quiz not found (maybe not visible to you yet)")
+
+    def get_quiz(self, tok):
+        if not self.quizzes:
+            self.load_quizzes()
+        if not self.quizzes:
+            raise MoodleError("no quizzes")
+        return self.quizzes[parse_nums([tok], len(self.quizzes))[0] - 1]
+
+    def quiz_rows(self, items, show_all=False):
+        now = time.time()
+        rows, hidden = [], 0
+        for i, q in enumerate(items, 1):
+            close, opn = q.get("timeclose") or 0, q.get("timeopen") or 0
+            if not show_all and close and close < now - 7 * 86400:
+                hidden += 1
+                continue
+            when = due_color(close, fmt_time(close)) if close else dim("no closing date      ")
+            state = (yellow("not open yet") if opn and opn > now else dim("closed") if close and close < now
+                     else green("open"))
+            tl = dim(f"  {q['timelimit'] // 60} min") if q.get("timelimit") else ""
+            rows.append((f"[{i:>3}] {when}  {bold(html2text(q['name'], links=False))}  {state}{tl}  "
+                         f"{dim(q['_course'].get('shortname', ''))}  {dim(rel(close))}", q))
+        return rows, hidden
+
+    def do_quizzes(self, arg):
+        """quizzes [all] [course]  — list quizzes sorted by closing date."""
+        a = args_of(arg)
+        show_all = "all" in a
+        rest = " ".join(x for x in a if x != "all")
+        items = self.load_quizzes(self.find_course(rest) if rest else None)
+        rows, hidden = self.quiz_rows(items, show_all)
+        L = [t for t, _ in rows]
+        if hidden:
+            L.append(dim(f"\n  ({hidden} older quizzes hidden — `quizzes all`)"))
+        L.append(dim("\n  details: quiz <n>     take it: quiz <n> start     results: quiz <n> review"))
+        page("\n".join(L) if items else "No quizzes.")
+
+    def quiz_attempts(self, q, status="all"):
+        return self.need().call("mod_quiz_get_user_attempts", quizid=q["id"], status=status,
+                                includepreviews=1).get("attempts", [])
+
+    def quiz_grade(self, q, sumgrades):
+        if sumgrades is None:
+            return "-"
+        dp = max(0, int(q.get("decimalpoints") if q.get("decimalpoints") is not None else 2))
+        tot, g = q.get("sumgrades") or 0, q.get("grade") or 0
+        if not tot:
+            return f"{sumgrades:.{dp}f}"
+        s = f"{sumgrades:.{dp}f} / {tot:.{dp}f}"
+        if g and abs(g - tot) > 1e-9:
+            s += f"   (grade {sumgrades / tot * g:.{dp}f} / {g:.{dp}f})"
+        return s
+
+    def quiz_lines(self, q, hints=True):
+        m = self.need()
+        L = [bold(html2text(q["name"], links=False)) + dim(f"   {q['_course'].get('fullname', '')}")]
+        for label, key in (("Opens", "timeopen"), ("Closes", "timeclose")):
+            if q.get(key):
+                L.append(f"{label + ':':10}{due_color(q[key], fmt_time(q[key])) if key == 'timeclose' else fmt_time(q[key])}"
+                         f"  {dim(rel(q[key]))}")
+        if q.get("timelimit"):
+            tl = q["timelimit"]
+            L.append(f"{'Time:':10}{tl // 60} min{f' {tl % 60} s' if tl % 60 else ''} (the timer starts when you start an attempt)")
+        L.append(f"{'Attempts:':10}{q.get('attempts') or 'unlimited'} allowed"
+                 + (f" · grading: {({1: 'highest', 2: 'average', 3: 'first', 4: 'last'}).get(q.get('grademethod'), '?')} attempt"
+                    if q.get("grademethod") else ""))
+        if q.get("intro"):
+            L += ["", html2text(q["intro"])]
+        try:
+            acc = m.call("mod_quiz_get_quiz_access_information", quizid=q["id"])
+        except MoodleError as e:
+            acc = {}
+            L += ["", dim(f"(access info unavailable: {e})")]
+        if acc.get("accessrules"):
+            L += [""] + [dim("• ") + html2text(r, links=False) for r in acc["accessrules"]]
+        for r in acc.get("preventaccessreasons") or []:
+            L.append(yellow("• " + html2text(r, links=False)))
+        try:
+            attempts = self.quiz_attempts(q)
+        except MoodleError as e:
+            attempts = []
+            L += ["", dim(f"(attempts unavailable: {e})")]
+        if attempts:
+            L += ["", bold("Your attempts:")]
+            for a in attempts:
+                st = a.get("state")
+                if st == "finished":
+                    s = green("finished") + f"  {fmt_time(a.get('timefinish'))}   {self.quiz_grade(q, a.get('sumgrades'))}"
+                elif st in ("inprogress", "overdue"):
+                    s = yellow("in progress" if st == "inprogress" else "time is up — submit it") + \
+                        f"  started {fmt_time(a.get('timestart'))}"
+                else:
+                    s = dim(st or "?")
+                L.append(f"  #{a.get('attempt')}  {s}")
+            try:
+                bg = m.call("mod_quiz_get_user_best_grade", quizid=q["id"])
+                if bg.get("hasgrade"):
+                    dp = max(0, int(q.get("decimalpoints") if q.get("decimalpoints") is not None else 2))
+                    L.append(f"  {bold('Grade:')} {bg['grade']:.{dp}f} / {q.get('grade') or 0:.{dp}f}")
+            except MoodleError:
+                pass
+        elif not acc.get("preventaccessreasons"):
+            L += ["", dim("No attempts yet.")]
+        if hints:
+            n = self.quizzes.index(q) + 1 if q in self.quizzes else "?"
+            L.append(dim(f"\n  quiz {n} start  (start / continue)   |   quiz {n} review [attempt#]"))
+        return L
+
+    def show_quiz(self, q):
+        page("\n".join(self.quiz_lines(q)))
+
+    def do_quiz(self, arg):
+        """quiz <n> [start|review [attempt#]]  — quiz details, take a quiz in the terminal, review results."""
+        a = args_of(arg)
+        if not a:
+            raise MoodleError("usage: quiz <n> [start | review [attempt#]]   (numbers from `quizzes`)")
+        q = self.get_quiz(a[0])
+        sub = a[1] if len(a) > 1 else ""
+        if sub in ("start", "attempt", "continue", "take"):
+            return self.run_quiz(q)
+        if sub == "review":
+            return self.review_quiz(q, a[2] if len(a) > 2 else None)
+        if sub:
+            raise MoodleError("usage: quiz <n> [start | review [attempt#]]")
+        self.show_quiz(q)
+
+    # review ---------------------------------------------------------------- #
+    def review_lines(self, q, aid):
+        r = self.need().call("mod_quiz_get_attempt_review", attemptid=aid, page=-1)
+        at = r.get("attempt") or {}
+        L = [bold("Review: " + html2text(q["name"], links=False)) + dim(f"   attempt #{at.get('attempt', '?')}")]
+        L.append(f"started {fmt_time(at.get('timestart'))}   finished {fmt_time(at.get('timefinish'))}")
+        if at.get("sumgrades") is not None:
+            L.append(bold("Marks: ") + self.quiz_grade(q, at.get("sumgrades")))
+        for d in r.get("additionaldata") or []:
+            txt = html2text(d.get("content"), links=False)
+            if txt:
+                L.append(f"{html2text(d.get('title'), links=False)}: {txt}")
+        for meta in r.get("questions") or []:
+            L += [""] + question_lines(meta, parse_question(meta.get("html") or ""))
+        return L
+
+    def review_quiz(self, q, which=None):
+        done = [a for a in self.quiz_attempts(q) if a.get("state") == "finished"]
+        if not done:
+            raise MoodleError("no finished attempts to review")
+        if which:
+            a = next((a for a in done if str(a.get("attempt")) == str(which)), None)
+            if not a:
+                raise MoodleError(f"no finished attempt #{which} (have: {', '.join(str(a.get('attempt')) for a in done)})")
+        else:
+            a = done[-1]
+        try:
+            self.m.call("mod_quiz_view_attempt_review", attemptid=a["id"])
+        except MoodleError:
+            pass
+        page("\n".join(self.review_lines(q, a["id"])))
+
+    # taking a quiz --------------------------------------------------------- #
+    QUIZ_RULES = {"quizaccess_openclosedate", "quizaccess_timelimit", "quizaccess_password",
+                  "quizaccess_numattempts", "quizaccess_delaybetweenattempts", "quizaccess_ipaddress",
+                  "quizaccess_offlineattempts"}
+
+    def quiz_preflight(self, acc, required):
+        rules = set(acc.get("activerulenames") or [])
+        data = []
+        if not required:
+            return data
+        if "quizaccess_password" in rules:
+            pw = getpass.getpass("Quiz password: ")
+            data.append({"name": "quizpassword", "value": pw})
+        if "quizaccess_offlineattempts" in rules:
+            data.append({"name": "confirmdatasaved", "value": "1"})
+        return data
+
+    def quiz_input(self, prompt, deadline, pq=None):
+        """input() that shows the remaining time and opens images (i1, i2, …)."""
+        while True:
+            left = time_left(deadline)
+            s = input(f"{prompt}{'  ' + left if left else ''} > ")
+            st = s.strip().lower()
+            if pq and re.fullmatch(r"i\d+", st):
+                n = int(st[1:])
+                if 1 <= n <= len(pq["images"]):
+                    self.open_quiz_image(pq["images"][n - 1])
+                else:
+                    err(f"no image {st}")
+                continue
+            return s
+
+    def open_quiz_image(self, url):
+        if url.startswith(self.m.url + "/"):
+            d = Path(tempfile.mkdtemp(prefix="moodle-quiz-"))
+            name = safe_name(urllib.parse.unquote(url.split("?")[0].rsplit("/", 1)[-1]) or "image", 120)
+            dest = d / name
+            self.m.download(url, dest, show=False)
+            target = str(dest)
+        else:
+            target = url  # foreign host: never send the Moodle token there
+        if (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) and shutil.which("xdg-open"):
+            subprocess.Popen(["xdg-open", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            print(dim(f"  opened {target}"))
+        else:
+            print(f"  image: {target}")
+
+    def quiz_ask_field(self, k, f, pq, deadline):
+        if f["readonly"]:
+            return
+        tag = f"  {QUIZ_MARK.format(k)}"
+        kind = f["kind"]
+        if kind in ("radio", "checkbox", "select"):
+            opts = visible_options(f)
+            if not opts:
+                return
+            many = kind == "checkbox"
+            keyed = all(o.get("key") for o in opts) and len({o["key"] for o in opts}) == len(opts)
+            rng = f"{opts[0]['key']}-{opts[-1]['key']}" if keyed else f"1-{len(opts)}"
+            ex = f"{opts[0]['key']} {opts[-1]['key']}" if keyed else f"1 {len(opts)}"
+            hint = (f"choose one or more ({rng}, e.g. {ex})" if many else f"choose {rng}") + ", Enter keep, - clear"
+            while True:
+                s = self.quiz_input(f"{tag} {hint}", deadline, pq).strip()
+                if not s:
+                    return
+                if s == "-":
+                    if kind == "radio":
+                        clear = next((o for o in f["options"] if o["hidden"]), None)
+                        f["value"] = clear["value"] if clear else None
+                    elif kind == "checkbox":
+                        for o in f["options"]:
+                            o["checked"] = False
+                    else:
+                        ph = select_placeholder(f)
+                        if ph is None:
+                            err("this field cannot be cleared")
+                            continue
+                        f["value"] = ph["value"]
+                    return
+                picks, bad = [], None
+                for tok in re.split(r"[\s,;]+", s):
+                    if not tok:
+                        continue
+                    hit = [o for o in opts if o.get("key") and o["key"] == tok.lower()] if keyed else []
+                    if len(hit) == 1:
+                        picks.append(hit[0])
+                        continue
+                    if tok.isdigit() and 1 <= int(tok) <= len(opts):
+                        picks.append(opts[int(tok) - 1])
+                        continue
+                    bad = tok
+                    break
+                if bad is not None:
+                    err(f"'{bad}' is not one of {rng}")
+                    continue
+                if not many and len(picks) != 1:
+                    err("choose exactly one")
+                    continue
+                if kind == "checkbox":
+                    for o in f["options"]:
+                        o["checked"] = o in picks
+                else:
+                    f["value"] = picks[0]["value"]
+                return
+        if kind == "text":
+            s = self.quiz_input(f"{tag} type answer (Enter keep, - clear)", deadline, pq)
+            if s.strip() == "":
+                return
+            f["value"] = "" if s.strip() == "-" else "-" if s.strip() == "\\-" else s.strip()
+            return
+        # textarea (essay)
+        s = self.quiz_input(f"{tag} e = write in $EDITOR, or type a one-line answer (Enter keep, - clear)", deadline, pq)
+        st = s.strip()
+        if not st:
+            return
+        is_html = f.get("format") == "1"
+        if st == "-":
+            f["value"] = ""
+            return
+        if st.lower() == "e":
+            cur = html2text(f["value"], links=False) if is_html else f["value"]
+            text = edit_text(cur)
+            if not text:
+                print(dim("  (empty — answer unchanged; type - to clear it)"))
+                return
+        else:
+            text = st
+        f["value"] = text_to_html(text) if is_html else text
+
+    @staticmethod
+    def quiz_page_data(qs):
+        d = {}
+        for meta, pq in qs:
+            d.update(question_data(pq))
+        d["slots"] = ",".join(str(meta["slot"]) for meta, _ in qs)
+        return d
+
+    @staticmethod
+    def wsdata(d):
+        return [{"name": k, "value": "" if v is None else str(v)} for k, v in d.items()]
+
+    def run_quiz(self, q):
+        """Start (or continue) an attempt and answer it in the terminal."""
+        if not sys.stdin.isatty():
+            raise MoodleError("taking a quiz needs an interactive terminal")
+        m = self.need()
+        name = html2text(q["name"], links=False)
+        acc = m.call("mod_quiz_get_quiz_access_information", quizid=q["id"])
+        rules = set(acc.get("activerulenames") or [])
+        unknown = rules - self.QUIZ_RULES
+        open_ = [a for a in self.quiz_attempts(q, "unfinished") if a.get("state") in ("inprogress", "overdue")]
+        print(bold(name) + dim(f"  ({q['_course'].get('shortname', '')})"))
+        for r in acc.get("accessrules") or []:
+            print(dim("• ") + html2text(r, links=False))
+        if unknown:
+            print(yellow("note: this quiz uses extra access rules (" + ", ".join(sorted(unknown)) +
+                         ") — if starting fails, use the browser."))
+        if open_:
+            att = open_[-1]
+            print(yellow(f"You have an unfinished attempt (#{att.get('attempt')}, started {fmt_time(att.get('timestart'))})."))
+            if not confirm("Continue it?", default=True):
+                return print("ok, nothing changed.")
+            ai = m.call("mod_quiz_get_attempt_access_information", quizid=q["id"], attemptid=att["id"])
+            pre = self.quiz_preflight(acc, ai.get("ispreflightcheckrequired"))
+        else:
+            if acc.get("preventaccessreasons"):
+                raise MoodleError("you cannot attempt this quiz now:\n  " +
+                                  "\n  ".join(html2text(r, links=False) for r in acc["preventaccessreasons"]))
+            ai = m.call("mod_quiz_get_attempt_access_information", quizid=q["id"])
+            if ai.get("preventnewattemptreasons"):
+                raise MoodleError("no new attempt possible:\n  " +
+                                  "\n  ".join(html2text(r, links=False) for r in ai["preventnewattemptreasons"]))
+            done = len(self.quiz_attempts(q, "finished"))
+            allowed = q.get("attempts") or 0
+            print(f"This will be attempt {done + 1}" + (f" of {allowed}." if allowed else "."))
+            if q.get("timelimit"):
+                print(yellow(f"Time limit {q['timelimit'] // 60} min {q['timelimit'] % 60:02d} s — the timer starts "
+                             "as soon as you start, and the quiz is submitted automatically when time is up."))
+            pre = self.quiz_preflight(acc, ai.get("ispreflightcheckrequired"))
+            if not confirm("Start the attempt now?"):
+                return print("cancelled.")
+            res = m.call("mod_quiz_start_attempt", quizid=q["id"], preflightdata=pre, forcenew=0)
+            for w in res.get("warnings") or []:
+                err(w.get("message") or w)
+            att = res.get("attempt")
+            if not att:
+                raise MoodleError("the attempt could not be started")
+            try:
+                m.call("mod_quiz_view_quiz", quizid=q["id"])
+            except MoodleError:
+                pass
+        self.quiz_attempt_loop(q, att, pre)
+
+    def quiz_attempt_loop(self, q, att, pre):
+        m = self.m
+        aid = att["id"]
+        name = html2text(q["name"], links=False)
+        ai = m.call("mod_quiz_get_attempt_access_information", quizid=q["id"], attemptid=aid)
+        deadline = ai.get("endtime") or 0
+        layout = [x for x in (att.get("layout") or "").split(",") if x != ""]
+        npages = max(1, layout.count("0"))
+        nav = q.get("navmethod")  # "free" | "seq" | None (not told)
+        page_ = att.get("currentpage") or 0
+        maxpage = page_
+        pending = {}
+        state = att.get("state")
+        finished_state = None
+        use_alarm = bool(deadline) and hasattr(signal, "SIGALRM")
+        old_handler = None
+
+        def on_alarm(signum, frame):
+            raise QuizTimeUp()
+
+        if use_alarm:
+            old_handler = signal.signal(signal.SIGALRM, on_alarm)
+            # submit a few seconds before the deadline (the server's clock decides)
+            signal.alarm(max(1, int(deadline - time.time()) - 5))
+
+        def stop_alarm():
+            if use_alarm:
+                signal.alarm(0)
+
+        def finish(timeup=False):
+            stop_alarm()
+            res = m.call("mod_quiz_process_attempt", attemptid=aid, data=self.wsdata(pending if timeup else {}),
+                         finishattempt=1, timeup=int(timeup), preflightdata=pre)
+            for w in res.get("warnings") or []:
+                err(w.get("message") or w)
+            return res.get("state")
+
+        def can_jump(p):
+            return nav == "free" or (nav != "seq" and p <= maxpage)
+
+        try:
+            if state == "overdue":
+                page_ = None
+            while True:
+                if page_ is None:  # summary page
+                    act = self.quiz_summary(q, aid, pre, deadline, can_jump, overdue=(state == "overdue"))
+                    if act == "finish":
+                        finished_state = finish()
+                        break
+                    if act == "exit":
+                        stop_alarm()
+                        print(yellow("Left the quiz. Your attempt is still open") +
+                              (yellow(" and the timer keeps running") if deadline else "") +
+                              yellow(f" — continue with: quiz {self.quizzes.index(q) + 1 if q in self.quizzes else '<n>'} start"))
+                        return
+                    page_ = act
+                    continue
+                try:
+                    d = m.call("mod_quiz_get_attempt_data", attemptid=aid, page=page_, preflightdata=pre)
+                except MoodleError as e:
+                    err(e)
+                    page_ = None
+                    continue
+                state = (d.get("attempt") or {}).get("state", state)
+                if state == "overdue":
+                    print(red("Time is up — you can only submit now."))
+                    page_ = None
+                    continue
+                if state != "inprogress":
+                    finished_state = state
+                    break
+                maxpage = max(maxpage, page_)
+                try:
+                    m.call("mod_quiz_view_attempt", attemptid=aid, page=page_, preflightdata=pre)
+                except MoodleError:
+                    pass
+                qs = [(meta, parse_question(meta.get("html") or "")) for meta in d.get("questions") or []]
+                pending = self.quiz_page_data(qs)
+                print()
+                print(bold(f"{name} · page {page_ + 1}/{npages}") + ("   " + time_left(deadline) if deadline else ""))
+                for msg in d.get("messages") or []:
+                    print(dim(html2text(msg, links=False)))
+                print(dim("Enter keeps the shown answer · Ctrl-C = menu (summary / leave)"))
+                interrupted = False
+                try:
+                    for meta, pq in qs:
+                        print("\n".join(question_lines(meta, pq)))
+                        if meta.get("blockedbyprevious") or meta.get("type") == "description":
+                            continue
+                        if not pq["fields"] and meta.get("type") != "description":
+                            print(yellow("  This question type can't be answered in the terminal — open it in the browser:\n  "
+                                         f"{m.url}/mod/quiz/attempt.php?attempt={aid}&cmid={q.get('coursemodule')}&page={page_}"))
+                        for k, f in enumerate(pq["fields"], 1):
+                            self.quiz_ask_field(k, f, pq, deadline)
+                            pending = self.quiz_page_data(qs)
+                except (KeyboardInterrupt, EOFError):
+                    interrupted = True
+                    print()
+                pending = self.quiz_page_data(qs)
+                res = m.call("mod_quiz_process_attempt", attemptid=aid, data=self.wsdata(pending),
+                             finishattempt=0, timeup=0, preflightdata=pre)
+                for w in res.get("warnings") or []:
+                    err(w.get("message") or w)
+                state = res.get("state") or state
+                print(green("✓ answers saved"))
+                if state == "overdue":
+                    print(red("Time is up — you can only submit now."))
+                    page_ = None
+                    continue
+                if state != "inprogress":
+                    finished_state = state
+                    break
+                nextp = d.get("nextpage", -1)
+                if not interrupted:
+                    page_ = None if nextp in (-1, None) else nextp
+                    continue
+                opts = ["[Enter] next page" if nextp not in (-1, None) else "[Enter] summary", "r redo this page"]
+                if page_ > 0 and nav != "seq":
+                    opts.append("b back")
+                opts += ["s summary", "x leave (attempt stays open)"]
+                while True:
+                    c = self.quiz_input("  " + " · ".join(opts), deadline).strip().lower()
+                    if c == "":
+                        page_ = None if nextp in (-1, None) else nextp
+                    elif c == "r":
+                        pass
+                    elif c == "b" and page_ > 0 and nav != "seq":
+                        page_ -= 1
+                    elif c == "s":
+                        page_ = None
+                    elif c == "x":
+                        stop_alarm()
+                        print(yellow("Left the quiz. Your attempt is still open") +
+                              (yellow(" and the timer keeps running.") if deadline else "."))
+                        return
+                    else:
+                        continue
+                    break
+        except QuizTimeUp:
+            print()
+            print(red(bold("Time is up — submitting your attempt…")))
+            finished_state = finish(timeup=True)
+        except (KeyboardInterrupt, EOFError):
+            stop_alarm()
+            print(yellow("\nLeft the quiz. Your attempt is still open") +
+                  (yellow(" and the timer keeps running.") if deadline else "."))
+            return
+        finally:
+            stop_alarm()
+            if use_alarm:
+                signal.signal(signal.SIGALRM, old_handler or signal.SIG_DFL)
+        self.quiz_done(q, aid, finished_state)
+
+    def quiz_summary(self, q, aid, pre, deadline, can_jump, overdue=False):
+        m = self.m
+        s = m.call("mod_quiz_get_attempt_summary", attemptid=aid, preflightdata=pre)
+        try:
+            m.call("mod_quiz_view_attempt_summary", attemptid=aid, preflightdata=pre)
+        except MoodleError:
+            pass
+        qs = [x for x in s.get("questions") or [] if x.get("type") != "description"]
+        print()
+        print(bold("Summary of your attempt") + ("   " + time_left(deadline) if deadline else ""))
+        todo = 0
+        for x in qs:
+            num = x.get("questionnumber") or x.get("number")
+            st = x.get("status") or x.get("state") or ""
+            if x.get("state") in ("todo", "invalid"):
+                todo += 1
+                st = yellow(st)
+            print(f"  {num!s:>4}  {st}" + (yellow("  ⚑") if x.get("flagged") else ""))
+        if todo:
+            print(yellow(f"  {todo} question(s) not answered yet."))
+        jumpable = {str(x.get("questionnumber") or x.get("number")): x.get("page") for x in qs
+                    if not overdue and x.get("page") is not None and can_jump(x["page"])}
+        opts = ["f submit all and finish"]
+        if jumpable:
+            opts.append("<number> go to question")
+        opts.append("x leave (attempt stays open)")
+        while True:
+            c = self.quiz_input("  " + " · ".join(opts), deadline).strip().lower()
+            if c == "f":
+                if confirm("Submit all and finish? You can't change your answers afterwards."):
+                    return "finish"
+                continue
+            if c == "x":
+                return "exit"
+            if c in jumpable:
+                return jumpable[c]
+            if c:
+                err("unknown choice")
+
+    def quiz_done(self, q, aid, state):
+        if state == "finished":
+            print(green(bold("✓ Attempt submitted.")))
+        elif state == "abandoned":
+            print(red("The attempt was closed without being submitted in time (abandoned)."))
+            return
+        else:
+            print(yellow(f"Attempt state: {state}"))
+            return
+        try:
+            lines = self.review_lines(q, aid)
+        except MoodleError as e:
+            return print(dim(f"Review not available (yet): {str(e).split(chr(10))[0]}"))
+        at_marks = next((l for l in lines if strip_ansi(l).startswith("Marks: ")), None)
+        if at_marks:
+            print(at_marks)
+        if confirm("Show the review (your answers, feedback)?", default=True):
+            page("\n".join(lines))
+
+    # -- grades ------------------------------------------------------------- #
+    def grade_rows(self):
+        res = self.need().call("gradereport_overview_get_course_grades")
+        byid = {c["id"]: c for c in self.courses()}
+        rows = []
+        for g in res.get("grades", []):
+            c = byid.get(g["courseid"])
+            if not c:
+                continue
+            i = self.courses().index(c) + 1
+            grade = html2text(g.get("grade"), links=False) or "-"
+            rows.append((f"[{i:>3}] {bold(f'{grade:>10}')}  {html2text(c.get('fullname'), links=False)}"
+                         + (dim("  (past)") if self.is_past(c) else ""), c))
+        return rows
+
+    def do_grades(self, arg):
+        """grades [course]  — grade overview, or grade items of one course."""
+        if arg.strip():
+            return page("\n".join(self.course_grade_lines(self.find_course(arg))))
+        rows = self.grade_rows()
+        page("\n".join([t for t, _ in rows] + [dim("\n  details: grades <n>")]))
+
+    def course_grade_lines(self, c):
+        res = self.need().call("gradereport_user_get_grade_items", courseid=c["id"], userid=self.uid)
+        ug = (res.get("usergrades") or [{}])[0]
+        L = [bold(html2text(c["fullname"], links=False)), ""]
+        items = ug.get("gradeitems") or []
+        namew = min(50, max([len(html2text(i.get("itemname") or "", links=False)) for i in items] + [14]))
+        L.append(dim(f"{'Item':<{namew}}  {'Grade':>10}  {'Range':>10}  {'%':>8}"))
+        for it in items:
+            name = html2text(it.get("itemname") or ("Course total" if it.get("itemtype") == "course" else "Category total"), links=False)
+            grade = html2text(it.get("gradeformatted"), links=False) or "-"
+            line = f"{name[:namew]:<{namew}}  {grade:>10}  {html2text(it.get('rangeformatted'), links=False):>10}  {html2text(it.get('percentageformatted'), links=False):>8}"
+            L.append(bold(line) if it.get("itemtype") in ("course", "category") else line)
+            if it.get("feedback"):
+                L.append(html2text(it["feedback"], indent="    │ "))
+        if not items:
+            L.append(dim("no grade items."))
+        return L
+
+    # -- notifications & messages ------------------------------------------ #
+    def notification_rows(self):
+        res = self.need().call("message_popup_get_popup_notifications", useridto=self.uid, limit=30, newestfirst=1)
+        rows = []
+        for n in res.get("notifications", []):
+            dot = blue("● ") if not n.get("read") else "  "
+            rows.append((f"{dot}{bold(html2text(n.get('subject'), links=False))}  {dim(rel(n.get('timecreated')))}", n))
+            sm = html2text(n.get("smallmessage") or n.get("fullmessage"), links=False).replace("\n", " ")
+            if sm and sm != html2text(n.get("subject"), links=False):
+                rows.append((dim("    " + textwrap.shorten(sm, width() - 6, placeholder="…")), None))
+        return rows
+
+    def notification_lines(self, n):
+        L = [bold(html2text(n.get("subject"), links=False)), dim(fmt_time(n.get("timecreated"))), ""]
+        L.append(html2text(n.get("fullmessagehtml") or n.get("fullmessage") or n.get("smallmessage")))
+        if n.get("contexturl"):
+            L += ["", dim("web: " + n["contexturl"])]
+        return L
+
+    def do_notifications(self, arg):
+        """notifications [read]  — show notifications; `read` marks all as read."""
+        if arg.strip() == "read":
+            self.need().call("core_message_mark_all_notifications_as_read", useridto=self.uid)
+            return print("all notifications marked as read.")
+        rows = self.notification_rows()
+        page("\n".join(t for t, _ in rows) if rows else "No notifications.")
+
+    def conv_name(self, conv):
+        if conv.get("name"):
+            return html2text(conv["name"], links=False)
+        names = [mm.get("fullname") for mm in conv.get("members") or [] if mm.get("id") != self.uid]
+        return ", ".join(n for n in names if n) or "(you)"
+
+    def conv_rows(self):
+        res = self.need().call("core_message_get_conversations", userid=self.uid, limitnum=40)
+        self.convs = res.get("conversations", [])
+        rows = []
+        for i, c in enumerate(self.convs, 1):
+            unread = c.get("unreadcount") or 0
+            last = (c.get("messages") or [{}])[0]
+            preview = textwrap.shorten(html2text(last.get("text"), links=False).replace("\n", " ") or "", 60, placeholder="…")
+            rows.append((f"[{i:>3}] {bold(self.conv_name(c)) if unread else self.conv_name(c)}"
+                         + (blue(f" ({unread} new)") if unread else "") + f"  {dim(rel(last.get('timecreated')))}", c))
+            if preview:
+                rows.append((dim("        " + preview), None))
+        return rows
+
+    def do_messages(self, arg):
+        """messages  — list your conversations."""
+        rows = self.conv_rows()
+        L = [t for t, _ in rows] + [dim("\n  open: chat <n>     new: write <name>")]
+        page("\n".join(L) if self.convs else "No conversations. Start one with: write <name>")
+
+    def conversation_lines(self, conv):
+        res = self.need().call("core_message_get_conversation_messages", currentuserid=self.uid,
+                               convid=conv["id"], limitnum=50, newest=1)
+        names = {mm["id"]: mm.get("fullname") for mm in res.get("members") or []}
+        names[self.uid] = "You"
+        out = [bold(self.conv_name(conv)), ""]
+        for msg in reversed(res.get("messages") or []):
+            who = names.get(msg.get("useridfrom"), "?")
+            col = green if msg.get("useridfrom") == self.uid else cyan
+            out.append(f"{col(bold(who))}  {dim(fmt_time(msg.get('timecreated')))}")
+            out.append(html2text(msg.get("text"), indent="  "))
+        try:
+            self.m.call("core_message_mark_all_conversation_messages_as_read", userid=self.uid, conversationid=conv["id"])
+        except MoodleError:
+            pass
+        return out
+
+    def send_to_conv(self, conv, text):
+        self.need().call("core_message_send_messages_to_conversation", conversationid=conv["id"],
+                         messages=[{"text": text, "textformat": 2}])
+
+    def do_chat(self, arg):
+        """chat <n>  — read a conversation and reply (empty line = back, /r = refresh)."""
+        if not self.convs:
+            self.conv_rows()
+        conv = self.convs[parse_nums(args_of(arg) or ["?"], len(self.convs))[0] - 1]
+        print("\n".join(self.conversation_lines(conv)))
+        if not sys.stdin.isatty():
+            return
+        print(dim("\nType a message and press Enter to send. Empty line = back, /r = refresh."))
+        while True:
+            try:
+                line = input(green("you> ")).strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if not line:
+                break
+            if line == "/r":
+                print("\n".join(self.conversation_lines(conv)))
+                continue
+            self.send_to_conv(conv, line)
+            print(dim("  sent ✓"))
+
+    def do_write(self, arg):
+        """write <name> [message]  — send a private message to someone."""
+        a = args_of(arg)
+        if not a:
+            raise MoodleError("usage: write <name> [message]")
+        res = self.need().call("core_message_message_search_users", userid=self.uid, search=a[0], limitnum=20)
+        people = (res.get("contacts") or []) + (res.get("noncontacts") or [])
+        if not people:
+            raise MoodleError(f"nobody found for '{a[0]}'")
+        if len(people) > 1:
+            for i, p in enumerate(people, 1):
+                print(f"[{i:>2}] {p.get('fullname')}")
+            pick = input("who? ").strip()
+            person = people[parse_nums([pick], len(people))[0] - 1]
+        else:
+            person = people[0]
+        text = " ".join(a[1:]) or input(f"message to {person.get('fullname')}: ").strip()
+        if not text:
+            return print("cancelled.")
+        out = self.m.call("core_message_send_instant_messages",
+                          messages=[{"touserid": person["id"], "text": text, "textformat": 2}])
+        if out and out[0].get("errormessage"):
+            raise MoodleError(out[0]["errormessage"])
+        print(green("✓ ") + f"sent to {person.get('fullname')}")
+
+    # -- forums ------------------------------------------------------------- #
+    def forum_discussions(self, mod):
+        self.forum = mod
+        res = self.need().call("mod_forum_get_forum_discussions", forumid=mod["instance"],
+                               sortorder=-1, page=0, perpage=50)
+        self.discussions = res.get("discussions", [])
+        return self.discussions
+
+    def discussion_rows(self, discussions):
+        rows = []
+        for i, d in enumerate(discussions, 1):
+            pin = yellow("[pinned] ") if d.get("pinned") else ""
+            rows.append((f"[{i:>3}] {pin}{bold(html2text(d.get('name'), links=False))}  "
+                         f"{dim(d.get('userfullname', ''))}  {dim(str(d.get('numreplies', 0)) + ' replies')}  "
+                         f"{dim(rel(d.get('timemodified')))}", d))
+        return rows
+
+    def show_forum(self, mod):
+        rows = self.discussion_rows(self.forum_discussions(mod))
+        L = [""] + [t for t, _ in rows] + [dim("\n  read <n>     newpost")]
+        page("\n".join(L) if rows else "\nNo discussions yet. Start one with: newpost")
+
+    def discussion_posts(self, d):
+        res = self.need().call("mod_forum_get_discussion_posts", discussionid=d["discussion"],
+                               sortby="created", sortdirection="ASC")
+        self.discussion = d
+        self.posts = res.get("posts", [])
+        return self.posts
+
+    def post_rows(self, posts):
+        depth, rows = {}, []
+        for i, p in enumerate(posts, 1):
+            lvl = depth.get(p.get("parentid"), -1) + 1 if p.get("parentid") else 0
+            depth[p["id"]] = lvl
+            ind = "    " * min(lvl, 4)
+            author = (p.get("author") or {}).get("fullname", "?")
+            subj = html2text(p.get("subject"), links=False)
+            rows.append((f"{ind}{dim(f'#{i}')} {cyan(bold(author))}  {dim(fmt_time(p.get('timecreated')))}"
+                         + (f"  {bold(subj)}" if lvl == 0 or not subj.startswith("Re:") else ""), p))
+            rows += [(l, None) for l in html2text(p.get("message"), indent=ind + "  ").split("\n")]
+            for a in p.get("attachments") or []:
+                rows.append((f"{ind}  * {a.get('filename')}  {dim(a.get('url') or a.get('fileurl') or '')}", None))
+            rows.append(("", None))
+        return rows
+
+    def do_read(self, arg):
+        """read <n>  — read a discussion of the forum opened with `show`."""
+        if not self.discussions:
+            raise MoodleError("open a forum first: show <n>")
+        d = self.discussions[parse_nums(args_of(arg) or ["?"], len(self.discussions))[0] - 1]
+        rows = self.post_rows(self.discussion_posts(d))
+        page("\n".join([bold(html2text(d.get("name"), links=False)), ""] + [t for t, _ in rows] + [dim("  reply <#post> [text]")]))
+
+    def reply_post(self, p, text):
+        subj = html2text(p.get("subject"), links=False)
+        subj = subj if subj.startswith("Re:") else "Re: " + subj
+        self.need().call("mod_forum_add_discussion_post", postid=p["id"], subject=subj, message=text_to_html(text))
+
+    def do_reply(self, arg):
+        """reply <#post> [text]  — reply to a post in the open discussion."""
+        if not self.posts:
+            raise MoodleError("open a discussion first: read <n>")
+        a = args_of(arg)
+        p = self.posts[parse_nums([a[0].lstrip("#")] if a else ["?"], len(self.posts))[0] - 1]
+        text = " ".join(a[1:]) or edit_text()
+        if not text:
+            return print("cancelled.")
+        self.reply_post(p, text)
+        print(green("✓ reply posted."))
+
+    def new_discussion(self, forum):
+        subject = input("Subject: ").strip()
+        if not subject:
+            return print("cancelled.")
+        text = edit_text()
+        if not text:
+            return print("cancelled.")
+        self.need().call("mod_forum_add_discussion", forumid=forum["instance"], subject=subject, message=text_to_html(text))
+        print(green("✓ discussion posted."))
+
+    def do_newpost(self, arg):
+        """newpost  — start a new discussion in the forum opened with `show`."""
+        if not self.forum:
+            raise MoodleError("open a forum first: show <n>")
+        self.new_discussion(self.forum)
+
+    # -- completion for course names --------------------------------------- #
+    def complete_course(self, text, *_):
+        try:
+            return [c["shortname"] for c in (self._courses or []) if c["shortname"].lower().startswith(text.lower())]
+        except Exception:
+            return []
+
+    complete_sync = complete_grades = complete_course
+
+
+# =========================================================================== #
+#  Full-screen TUI (curses)
+# =========================================================================== #
+
+ANSI_RE = re.compile(r"\033\[([\d;]*)m")
+
+TUI_HELP = """
+Moving around
+  ↑ ↓   j k            move up / down
+  Enter  →  l          open
+  Esc  ←  h  Backspace go back
+  PgUp PgDn  Space     page up / down
+  g  G  Home End       top / bottom
+  1 … 8   Tab  S-Tab   switch tab
+  /                    filter the list (Esc clears)
+  r                    reload
+  mouse                click selects, click again opens, wheel scrolls
+  q                    quit
+
+Actions (the bottom line always shows the ones for the current screen)
+  Courses              s  sync all files of the course   m  move course to current/hidden/past
+  Course               d  download item   s  sync course   c  toggle done ✓   o  open file
+  Files                Enter download     o  open          a  download all
+  Assignment           u  upload files    t  online text   d  download all files
+  Assignments          a  show / hide old ones
+  Quiz                 s  start / continue an attempt (answer in the terminal)   v  review
+  Quizzes              a  show / hide old ones
+  Messages             m  new message     (in a chat: Enter or m to write)
+  Forum                n  new discussion  (in a discussion: m to reply to the selected post)
+  Notifications        a  mark all as read
+
+Files are saved to your download folder (shell command `dir` to change it).
+Opening files: uses xdg-open in a graphical session; in a pure terminal, text and
+html files open in less, PDFs too if `pdftotext` (poppler) is installed.
+Set MOODLE_OPENER to use your own viewer.
+"""
+
+
+def strip_ansi(s):
+    return ANSI_RE.sub("", s)
+
+
+def char_w(ch):
+    import unicodedata
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+class Row:
+    __slots__ = ("text", "data", "sel")
+
+    def __init__(self, text, data=None, sel=None):
+        self.text = text.replace("\t", "    ")
+        self.data = data
+        self.sel = data is not None if sel is None else sel
+
+
+def rows_from(pairs):
+    out = []
+    for text, data in pairs:
+        lines = str(text).split("\n")
+        out.append(Row(lines[0], data))
+        out += [Row(l, sel=False) for l in lines[1:]]
+    return out
+
+
+def text_rows(text):
+    if isinstance(text, (list, tuple)):
+        text = "\n".join(text)
+    return [Row(l, sel=False) for l in str(text).split("\n")]
+
+
+class View:
+    hint = ""
+
+    def __init__(self, app, title):
+        self.app, self.sh, self.title = app, app.sh, title
+        self.all_rows, self.rows = [], []
+        self.sel, self.top = -1, 0
+        self.filter = ""
+        self.loaded = False
+
+    # data
+    def build(self):
+        return []
+
+    def load(self):
+        keep = self.sel if self.loaded else None
+        self.all_rows = self.build() or text_rows(dim("(empty)"))
+        self.loaded = True
+        self.apply_filter(keep)
+        self.on_loaded()
+
+    def on_loaded(self):
+        pass
+
+    def apply_filter(self, keep=None):
+        if self.filter:
+            q = self.filter.lower()
+            self.rows = [r for r in self.all_rows if r.sel and q in strip_ansi(r.text).lower()]
+        else:
+            self.rows = self.all_rows
+        sels = self.selectable()
+        if keep is not None and keep in sels:
+            self.sel = keep
+        else:
+            self.sel = sels[0] if sels else -1
+            self.top = 0
+        self.clamp()
+
+    def selectable(self):
+        return [i for i, r in enumerate(self.rows) if r.sel]
+
+    @property
+    def current(self):
+        return self.rows[self.sel].data if 0 <= self.sel < len(self.rows) else None
+
+    # hooks
+    def enter(self, data):
+        pass
+
+    def key(self, k, data):
+        return False
+
+    # movement
+    def bh(self):
+        return self.app.body_h()
+
+    def clamp(self):
+        self.top = max(0, min(self.top, len(self.rows) - self.bh()))
+
+    def show_sel(self):
+        bh = self.bh()
+        if self.sel < 0:
+            return
+        if self.sel >= self.top + bh:
+            self.top = self.sel - bh + 1
+        if self.sel < self.top:
+            self.top = self.sel
+            # also show headers directly above the selection
+            j = self.sel - 1
+            while j >= 0 and not self.rows[j].sel and self.sel - j <= 3 and strip_ansi(self.rows[j].text).strip():
+                self.top = j
+                j -= 1
+        self.clamp()
+
+    def move(self, d):
+        bh = self.bh()
+        if self.sel < 0:
+            self.top += d
+            return self.clamp()
+        rng = range(self.sel + 1, len(self.rows)) if d > 0 else range(self.sel - 1, -1, -1)
+        nxt = next((j for j in rng if self.rows[j].sel), None)
+        if nxt is not None and abs(nxt - self.sel) <= max(4, bh // 2):
+            self.sel = nxt
+            return self.show_sel()
+        # long text between items (or no more items): scroll line by line
+        old = self.top
+        self.top += d
+        self.clamp()
+        if self.top == old and nxt is not None:
+            self.sel = nxt
+            self.show_sel()
+        elif nxt is not None and self.top <= nxt < self.top + bh and (d > 0) == (nxt > self.sel):
+            if (d > 0 and nxt == self.top + bh - 1) or (d < 0 and nxt == self.top):
+                self.sel = nxt
+
+    def scroll(self, n):
+        self.top += n
+        self.clamp()
+        bh = self.bh()
+        if self.sel >= 0 and not (self.top <= self.sel < self.top + bh):
+            vis = [i for i in self.selectable() if self.top <= i < self.top + bh]
+            if vis:
+                self.sel = vis[0] if n > 0 else vis[-1]
+
+    def home(self):
+        self.top = 0
+        s = self.selectable()
+        if s:
+            self.sel = s[0]
+            self.show_sel()
+
+    def end(self):
+        self.top = len(self.rows)
+        self.clamp()
+        s = self.selectable()
+        if s:
+            self.sel = s[-1]
+            self.show_sel()
+
+
+class TextView(View):
+    def __init__(self, app, title, builder, hint=""):
+        super().__init__(app, title)
+        self.builder, self.hint = builder, hint
+
+    def build(self):
+        return text_rows(self.builder())
+
+
+class HelpView(TextView):
+    def __init__(self, app):
+        super().__init__(app, "Help", lambda: TUI_HELP.strip("\n"))
+
+
+class CoursesView(View):
+    hint = "Enter open · s sync files · m move to group · / filter"
+
+    def __init__(self, app):
+        super().__init__(app, "Courses")
+
+    def build(self):
+        self.sh.courses(refresh=self.loaded)
+        return self.build_rows()
+
+    def build_rows(self):
+        rows = []
+        for title, items in self.sh.course_groups():
+            if not items:
+                continue
+            if rows:
+                rows.append(Row("", sel=False))
+            rows.append(Row(cyan(bold(f"{title} ({len(items)})")), sel=False))
+            rows += [Row(self.sh.course_line(i, c), c) for i, c in items]
+        return rows or text_rows("You are not enrolled in any courses.")
+
+    def enter(self, c):
+        self.app.push(CourseView(self.app, c))
+
+    def key(self, k, c):
+        if k == "s" and c:
+            self.app.sync_course(c)
+            return True
+        if k == "m" and c:
+            ans = self.app.prompt("move to  [c]urrent  [h]idden  [p]ast  [a]uto: ")
+            target = {"c": "current", "h": "hidden", "p": "past", "a": "auto"}.get((ans or "").strip()[:1].lower())
+            if target:
+                self.sh.set_group([c], target)
+                self.all_rows = self.build_rows()
+                self.apply_filter()
+                for i, r in enumerate(self.rows):
+                    if r.data is c:
+                        self.sel = i
+                        self.show_sel()
+                self.app.msg = green(f"✓ moved to {target}")
+            return True
+
+
+class CourseView(View):
+    hint = "Enter open · d download · s sync course · c done ✓ · o open file"
+
+    def __init__(self, app, c):
+        super().__init__(app, c.get("shortname") or c.get("fullname"))
+        self.c = c
+
+    def build(self):
+        sections, self.mods = self.sh.course_modules(self.c)
+        if self.sh.cfg.get("last_course") != self.c["id"]:
+            self.sh.cfg["last_course"] = self.c["id"]
+            save_config(self.sh.cfg)
+        return rows_from(self.sh.course_rows(sections, header_course=self.c))
+
+    def enter(self, mod):
+        app, kind = self.app, mod["modname"]
+        name = html2text(mod.get("name"), links=False)
+        if mod.get("uservisible", True):
+            if kind in ("resource", "folder"):
+                return app.push(FilesView(app, mod, self.c))
+            if kind == "assign":
+                return app.push(AssignmentView(app, self.sh.find_assign(cmid=mod["id"], course=self.c)))
+            if kind == "forum":
+                return app.push(ForumView(app, mod))
+            if kind == "quiz":
+                return app.push(QuizView(app, self.sh.find_quiz(cmid=mod["id"], course=self.c)))
+        app.push(TextView(app, name, lambda: self.sh.mod_lines(mod, hints=False)))
+
+    def key(self, k, mod):
+        if k == "s":
+            self.app.sync_course(self.c)
+        elif mod is None:
+            return False
+        elif k == "d":
+            pairs = self.sh.mod_files(mod, self.c)
+            if not pairs:
+                self.app.msg = yellow("no files in this item")
+            else:
+                got, _ = self.sh.fetch_files(pairs, force=True, log=self.app.status, show=False)
+                self.app.msg = green(f"✓ {got} file(s) → {pairs[0][1].parent}")
+        elif k == "o":
+            pairs = self.sh.mod_files(mod, self.c)
+            if len(pairs) != 1:
+                if pairs:
+                    self.app.push(FilesView(self.app, mod, self.c))
+                else:
+                    self.app.msg = yellow("nothing to open")
+            else:
+                self.app.open_file(*pairs[0])
+        elif k == "c":
+            new = self.sh.toggle_done(mod)
+            self.rows[self.sel].text = self.sh.mod_line(int(re.search(r"\[\s*(\d+)\]", strip_ansi(self.rows[self.sel].text)).group(1)), mod)
+            self.app.msg = green("marked done ✓") if new else "marked not done"
+        else:
+            return False
+        return True
+
+
+class FilesView(View):
+    hint = "Enter download · o open · a download all"
+
+    def __init__(self, app, mod, c):
+        super().__init__(app, html2text(mod.get("name"), links=False))
+        self.mod, self.c = mod, c
+
+    def build(self):
+        rows = []
+        if self.mod.get("description"):
+            rows += text_rows(html2text(self.mod["description"])) + [Row("", sel=False)]
+        for f, dest in self.sh.mod_files(self.mod, self.c):
+            path = (f.get("filepath") or "/").lstrip("/") + f["filename"]
+            mark = green("  ✓ downloaded") if self.sh.up_to_date(f, dest) else ""
+            rows.append(Row(f"  {bold(path)}  {dim(human(f.get('filesize')))}  {dim(fmt_time(f.get('timemodified')))}{mark}", (f, dest)))
+        pairs = self.sh.mod_files(self.mod, self.c)
+        if pairs:
+            folder = os.path.commonpath([str(d.parent) for _, d in pairs])
+            rows += [Row("", sel=False), Row(dim(f"  saved to: {folder}"), sel=False)]
+        return rows or text_rows("No files.")
+
+    def enter(self, pair):
+        self.sh.fetch_files([pair], force=True, log=self.app.status, show=False)
+        self.app.msg = green(f"✓ saved {pair[1]}")
+        self.load()
+
+    def key(self, k, pair):
+        if k == "a":
+            got, skipped = self.sh.fetch_files(self.sh.mod_files(self.mod, self.c), log=self.app.status, show=False)
+            self.app.msg = green(f"✓ {got} downloaded, {skipped} already up to date")
+            self.load()
+        elif k == "o" and pair:
+            self.app.open_file(*pair)
+            self.load()
+        else:
+            return False
+        return True
+
+
+class AssignmentView(View):
+    hint = "u upload files · t online text · d download all files"
+
+    def __init__(self, app, x):
+        super().__init__(app, html2text(x["name"], links=False))
+        self.x = x
+
+    def build(self):
+        return text_rows(self.sh.assignment_lines(self.x, hints=False))
+
+    def key(self, k, _):
+        x, app = self.x, self.app
+        if k == "u":
+            def run():
+                print(bold("Upload files to: ") + x["name"])
+                print(dim("One path per line (Tab completes, drag & drop works). Empty line when done."))
+                paths = ask_paths()
+                if paths:
+                    self.sh.submit(x, paths, None)
+                else:
+                    print("cancelled.")
+            app.suspended(run)
+            app.load(self)
+        elif k == "t":
+            def run():
+                text = edit_text()
+                if text:
+                    self.sh.submit(x, [], text)
+                else:
+                    print("cancelled (empty text).")
+            app.suspended(run)
+            app.load(self)
+        elif k == "d":
+            got, base = self.sh.get_assignment_files(x, log=app.status, show=False)
+            app.msg = green(f"✓ {got} files → {base}") if got else yellow("no files")
+        else:
+            return False
+        return True
+
+
+class AssignmentsView(View):
+    hint = "Enter open · a show/hide old"
+
+    def __init__(self, app):
+        super().__init__(app, "Assignments")
+        self.show_all = False
+
+    def build(self):
+        rows, hidden = self.sh.assignment_rows(self.sh.load_assigns(), self.show_all)
+        out = rows_from(rows)
+        if hidden:
+            out += [Row("", sel=False), Row(dim(f"  {hidden} older assignments hidden — press a"), sel=False)]
+        return out or text_rows("No assignments.")
+
+    def enter(self, x):
+        self.app.push(AssignmentView(self.app, x))
+
+    def key(self, k, x):
+        if k == "a":
+            self.show_all = not self.show_all
+            self.app.load(self)
+            return True
+
+
+class TodoView(View):
+    hint = "Enter open"
+
+    def __init__(self, app):
+        super().__init__(app, "To-do")
+
+    def build(self):
+        return rows_from(self.sh.todo_rows()) or text_rows(green("Nothing to do."))
+
+    def enter(self, e):
+        if e.get("modulename") == "assign" and e.get("instance"):
+            try:
+                return self.app.push(AssignmentView(self.app, self.sh.find_assign(instance=e["instance"])))
+            except MoodleError:
+                pass
+        if e.get("modulename") == "quiz" and e.get("instance"):
+            try:
+                return self.app.push(QuizView(self.app, self.sh.find_quiz(instance=e["instance"])))
+            except MoodleError:
+                pass
+        self.app.push(TextView(self.app, html2text(e.get("name"), links=False), lambda: self.sh.event_lines(e)))
+
+
+class CalendarView(TodoView):
+    def __init__(self, app):
+        View.__init__(self, app, "Calendar")
+
+    def build(self):
+        return rows_from(self.sh.calendar_rows()) or text_rows("No upcoming events.")
+
+
+class GradesView(View):
+    hint = "Enter details"
+
+    def __init__(self, app):
+        super().__init__(app, "Grades")
+
+    def build(self):
+        return rows_from(self.sh.grade_rows()) or text_rows("No grades.")
+
+    def enter(self, c):
+        self.app.push(TextView(self.app, c.get("shortname"), lambda: self.sh.course_grade_lines(c)))
+
+
+class MessagesView(View):
+    hint = "Enter open · m new message"
+
+    def __init__(self, app):
+        super().__init__(app, "Messages")
+
+    def build(self):
+        return rows_from(self.sh.conv_rows()) or text_rows("No conversations. Press m to write to someone.")
+
+    def enter(self, conv):
+        self.app.push(ChatView(self.app, conv))
+
+    def key(self, k, _):
+        if k == "m":
+            name = self.app.prompt("message to (name): ")
+            if name:
+                self.app.suspended(lambda: self.sh.do_write(shlex.quote(name)))
+                self.app.load(self)
+            return True
+
+
+class ChatView(View):
+    hint = "Enter / m write · r reload"
+
+    def __init__(self, app, conv):
+        super().__init__(app, app.sh.conv_name(conv))
+        self.conv = conv
+
+    def build(self):
+        return text_rows(self.sh.conversation_lines(self.conv))
+
+    def on_loaded(self):
+        self.end()
+
+    def key(self, k, _):
+        if k in ("m", "i", "\n", "\r", curses.KEY_ENTER):
+            text = self.app.prompt("you> ")
+            if text and text.strip():
+                self.sh.send_to_conv(self.conv, text.strip())
+                self.app.load(self)
+                self.app.msg = green("sent ✓")
+            return True
+
+
+class NotificationsView(View):
+    hint = "Enter open · a mark all read"
+
+    def __init__(self, app):
+        super().__init__(app, "Notifications")
+
+    def build(self):
+        return rows_from(self.sh.notification_rows()) or text_rows("No notifications.")
+
+    def enter(self, n):
+        self.app.push(TextView(self.app, html2text(n.get("subject"), links=False)[:40], lambda: self.sh.notification_lines(n)))
+
+    def key(self, k, _):
+        if k == "a":
+            self.sh.need().call("core_message_mark_all_notifications_as_read", useridto=self.sh.uid)
+            self.app.load(self)
+            self.app.msg = green("all marked as read")
+            return True
+
+
+class QuizView(View):
+    hint = "s start / continue attempt · v review last attempt"
+
+    def __init__(self, app, q):
+        super().__init__(app, html2text(q["name"], links=False))
+        self.q = q
+
+    def build(self):
+        return text_rows(self.sh.quiz_lines(self.q, hints=False))
+
+    def key(self, k, _):
+        if k == "s":
+            self.app.suspended(lambda: self.sh.run_quiz(self.q))
+            self.app.load(self)
+        elif k == "v":
+            self.app.suspended(lambda: self.sh.review_quiz(self.q))
+        else:
+            return False
+        return True
+
+
+class QuizzesView(View):
+    hint = "Enter open · a show/hide old"
+
+    def __init__(self, app):
+        super().__init__(app, "Quizzes")
+        self.show_all = False
+
+    def build(self):
+        rows, hidden = self.sh.quiz_rows(self.sh.load_quizzes(), self.show_all)
+        out = rows_from(rows)
+        if hidden:
+            out += [Row("", sel=False), Row(dim(f"  {hidden} older quizzes hidden — press a"), sel=False)]
+        return out or text_rows("No quizzes.")
+
+    def enter(self, q):
+        self.app.push(QuizView(self.app, q))
+
+    def key(self, k, q):
+        if k == "a":
+            self.show_all = not self.show_all
+            self.app.load(self)
+            return True
+
+
+class ForumView(View):
+    hint = "Enter read · n new discussion"
+
+    def __init__(self, app, mod):
+        super().__init__(app, html2text(mod.get("name"), links=False))
+        self.mod = mod
+
+    def build(self):
+        return rows_from(self.sh.discussion_rows(self.sh.forum_discussions(self.mod))) or \
+            text_rows("No discussions yet. Press n to start one.")
+
+    def enter(self, d):
+        self.app.push(DiscussionView(self.app, d))
+
+    def key(self, k, _):
+        if k == "n":
+            self.app.suspended(lambda: self.sh.new_discussion(self.mod))
+            self.app.load(self)
+            return True
+
+
+class DiscussionView(View):
+    hint = "↑↓ posts · m reply to selected post"
+
+    def __init__(self, app, d):
+        super().__init__(app, html2text(d.get("name"), links=False))
+        self.d = d
+
+    def build(self):
+        return rows_from(self.sh.post_rows(self.sh.discussion_posts(self.d)))
+
+    def key(self, k, p):
+        if k == "m" and p:
+            def run():
+                print(dim("Replying to ") + (p.get("author") or {}).get("fullname", "?"))
+                text = edit_text()
+                if text:
+                    self.sh.reply_post(p, text)
+                    print(green("✓ reply posted."))
+                else:
+                    print("cancelled.")
+            self.app.suspended(run)
+            self.app.load(self)
+            return True
+
+
+try:
+    import curses
+except ImportError:  # pragma: no cover
+    curses = None
+
+TEXT_EXT = {".txt", ".md", ".csv", ".tsv", ".py", ".c", ".h", ".cpp", ".java", ".js", ".ts", ".json",
+            ".xml", ".yaml", ".yml", ".tex", ".log", ".sh", ".sql", ".r", ".m", ".ini", ".cfg", ".rst"}
+
+
+class TUI:
+    TABS = [("Courses", CoursesView), ("To-do", TodoView), ("Assignments", AssignmentsView),
+            ("Grades", GradesView), ("Messages", MessagesView), ("Notifications", NotificationsView),
+            ("Calendar", CalendarView), ("Quizzes", QuizzesView)]
+
+    def __init__(self, sh):
+        self.sh = sh
+        self.stacks = [None] * len(self.TABS)
+        self.tab = 0
+        self.msg = ""
+        self.tab_pos = []
+        self.h, self.w = 24, 80
+
+    @property
+    def view(self):
+        return self.stacks[self.tab][-1]
+
+    def body_h(self):
+        return max(1, self.h - 3)
+
+    # -- setup -------------------------------------------------------------- #
+    def run(self):
+        import locale
+        locale.setlocale(locale.LC_ALL, "")
+        os.environ.setdefault("ESCDELAY", "25")
+        curses.wrapper(self.main)
+
+    def main(self, scr):
+        self.scr = scr
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        scr.keypad(True)
+        try:
+            curses.use_default_colors()
+            for i in range(1, 8):
+                curses.init_pair(i, i, -1)
+        except curses.error:
+            pass
+        try:
+            curses.mousemask(curses.ALL_MOUSE_EVENTS)
+            curses.mouseinterval(0)
+        except curses.error:
+            pass
+        self.h, self.w = scr.getmaxyx()
+        self.switch(0)
+        while True:
+            self.draw()
+            try:
+                k = scr.get_wch()
+            except KeyboardInterrupt:
+                self.msg = yellow("press q to quit")
+                continue
+            except curses.error:
+                continue
+            self.msg = ""
+            try:
+                if self.handle(k) == "quit":
+                    break
+            except MoodleError as e:
+                self.msg = red("error: " + str(e).split("\n")[0])
+            except KeyboardInterrupt:
+                self.msg = yellow("interrupted")
+
+    # -- navigation --------------------------------------------------------- #
+    def switch(self, i):
+        self.tab = i % len(self.TABS)
+        if self.stacks[self.tab] is None:
+            v = self.TABS[self.tab][1](self)
+            self.stacks[self.tab] = [v]
+            self.load(v)
+
+    def push(self, v):
+        self.stacks[self.tab].append(v)
+        self.load(v)
+
+    def pop(self):
+        if len(self.stacks[self.tab]) > 1:
+            self.stacks[self.tab].pop()
+
+    def load(self, v):
+        loading = dim("loading…")
+        self.status(loading)
+        try:
+            v.load()
+            if self.msg == loading:
+                self.msg = ""
+        except MoodleError as e:
+            v.all_rows = v.rows = text_rows(red("error: " + str(e)))
+            v.sel, v.loaded = -1, True
+            self.msg = red("error: " + str(e).split("\n")[0])
+
+    def status(self, msg):
+        self.msg = msg
+        self.draw()
+
+    # -- input -------------------------------------------------------------- #
+    def handle(self, k):
+        v = self.view
+        d = v.current
+        K = curses
+        if k == K.KEY_RESIZE:
+            curses.update_lines_cols()
+            return
+        if k == K.KEY_MOUSE:
+            return self.mouse()
+        if v.key(k, d):
+            return
+        if k in ("q", "Q"):
+            return "quit"
+        if isinstance(k, str) and len(k) == 1 and k in "12345678":
+            return self.switch(int(k) - 1)
+        if k in (K.KEY_UP, "k"):
+            v.move(-1)
+        elif k in (K.KEY_DOWN, "j"):
+            v.move(1)
+        elif k in (K.KEY_NPAGE, " ", "\x04"):
+            v.scroll(self.body_h() - 1)
+        elif k in (K.KEY_PPAGE, "\x15"):
+            v.scroll(-(self.body_h() - 1))
+        elif k in (K.KEY_HOME, "g"):
+            v.home()
+        elif k in (K.KEY_END, "G"):
+            v.end()
+        elif k == "\t":
+            self.switch(self.tab + 1)
+        elif k == K.KEY_BTAB:
+            self.switch(self.tab - 1)
+        elif k in ("\n", "\r", K.KEY_ENTER, K.KEY_RIGHT, "l"):
+            if d is not None:
+                v.enter(d)
+        elif k in (K.KEY_LEFT, "h", K.KEY_BACKSPACE, "\x7f", "\x08", "\x1b"):
+            if v.filter:
+                v.filter = ""
+                v.apply_filter()
+            else:
+                self.pop()
+        elif k == "/":
+            s = self.prompt("/", v.filter)
+            if s is not None:
+                v.filter = s.strip()
+                v.apply_filter()
+        elif k in ("r", K.KEY_F5):
+            self.load(v)
+        elif k == "?":
+            self.push(HelpView(self))
+
+    def mouse(self):
+        try:
+            _, mx, my, _, b = curses.getmouse()
+        except curses.error:
+            return
+        v = self.view
+        b4 = getattr(curses, "BUTTON4_PRESSED", 0)
+        b5 = getattr(curses, "BUTTON5_PRESSED", 0x200000)
+        if b & b4:
+            return v.scroll(-3)
+        if b & b5:
+            return v.scroll(3)
+        if not b & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED | curses.BUTTON1_DOUBLE_CLICKED | curses.BUTTON1_RELEASED):
+            return
+        if b & curses.BUTTON1_RELEASED and not b & curses.BUTTON1_CLICKED:
+            return
+        if my == 0:
+            for i, (x0, x1) in enumerate(self.tab_pos):
+                if x0 <= mx < x1:
+                    return self.switch(i)
+            return
+        if my == 1:
+            return self.pop()
+        idx = v.top + my - 2
+        if 2 <= my < 2 + self.body_h() and idx < len(v.rows) and v.rows[idx].sel:
+            if idx == v.sel or b & curses.BUTTON1_DOUBLE_CLICKED:
+                v.sel = idx
+                v.enter(v.current)
+            else:
+                v.sel = idx
+
+    def prompt(self, label, initial=""):
+        buf = list(initial or "")
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
+        try:
+            while True:
+                self.h, self.w = self.scr.getmaxyx()
+                text = label + "".join(buf)
+                shown = text[-(self.w - 2):]
+                self.scr.move(self.h - 1, 0)
+                self.scr.clrtoeol()
+                self.put(self.h - 1, 0, shown, curses.A_BOLD)
+                self.scr.move(self.h - 1, min(self.w - 2, sum(char_w(c) for c in shown)))
+                self.scr.refresh()
+                ch = self.scr.get_wch()
+                if ch in ("\n", "\r", curses.KEY_ENTER):
+                    return "".join(buf)
+                if ch == "\x1b":
+                    return None
+                if ch in (curses.KEY_BACKSPACE, "\x7f", "\x08"):
+                    if buf:
+                        buf.pop()
+                elif ch == "\x15":
+                    buf.clear()
+                elif ch == "\x17":  # ctrl-w
+                    while buf and buf[-1] == " ":
+                        buf.pop()
+                    while buf and buf[-1] != " ":
+                        buf.pop()
+                elif isinstance(ch, str) and ch.isprintable():
+                    buf.append(ch)
+        except KeyboardInterrupt:
+            return None
+        finally:
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+
+    def suspended(self, fn, pause=True):
+        """Leave curses temporarily (for $EDITOR, file prompts, pagers)."""
+        curses.def_prog_mode()
+        curses.endwin()
+        print()
+        try:
+            fn()
+        except MoodleError as e:
+            err(e)
+        except (KeyboardInterrupt, EOFError):
+            print("\ncancelled.")
+        if pause:
+            try:
+                print(dim("\n[Enter] back to moodle "), end="", flush=True)
+                input()
+            except (EOFError, KeyboardInterrupt):
+                pass
+        curses.reset_prog_mode()
+        self.scr.clear()
+        self.scr.refresh()
+
+    def open_file(self, f, dest):
+        if not self.sh.up_to_date(f, dest):
+            self.sh.fetch_files([(f, dest)], force=True, log=self.status, show=False)
+        path = str(dest)
+        opener = os.environ.get("MOODLE_OPENER")
+        less = ["less", "-R"] if shutil.which("less") else None
+        ext = dest.suffix.lower()
+        mt = mimetypes.guess_type(path)[0] or ""
+        if opener:
+            self.suspended(lambda: subprocess.call(shlex.split(opener) + [path]), pause=False)
+        elif (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) and shutil.which("xdg-open"):
+            subprocess.Popen(["xdg-open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+            self.msg = green(f"opened {dest.name}")
+        elif less and ext == ".pdf" and shutil.which("pdftotext"):
+            def run():
+                p = subprocess.Popen(["pdftotext", "-layout", path, "-"], stdout=subprocess.PIPE)
+                subprocess.call(less, stdin=p.stdout)
+                p.wait()
+            self.suspended(run, pause=False)
+        elif less and ext in (".html", ".htm"):
+            txt = html2text(dest.read_text("utf-8", "replace"))
+            self.suspended(lambda: subprocess.run(less, input=txt.encode()), pause=False)
+        elif less and (mt.startswith("text/") or ext in TEXT_EXT):
+            self.suspended(lambda: subprocess.call(less + [path]), pause=False)
+        else:
+            hint = " (install poppler for pdftotext)" if ext == ".pdf" else ""
+            self.msg = yellow(f"saved to {path} — no terminal viewer for {ext or 'this file'}{hint}")
+
+    def sync_course(self, c):
+        self.status(dim(f"syncing {c['shortname']}…"))
+        got, skipped = self.sh.sync_course(c, log=self.status, show=False)
+        self.msg = green(f"✓ {c['shortname']}: {got} downloaded, {skipped} up to date → {self.sh.dl_dir() / safe_name(c['shortname'])}")
+
+    # -- drawing ------------------------------------------------------------ #
+    def put(self, y, x, text, attr=0):
+        """Draw plain text, clipped to the screen width."""
+        if y >= self.h or x >= self.w - 1:
+            return x
+        out, col = [], x
+        for ch in text:
+            if not ch.isprintable():
+                continue
+            cw = char_w(ch)
+            if col + cw > self.w - 1:
+                break
+            out.append(ch)
+            col += cw
+        try:
+            self.scr.addstr(y, x, "".join(out), attr)
+        except curses.error:
+            pass
+        return col
+
+    def put_ansi(self, y, x, text, extra=0, fill=False):
+        attr, pos, col = 0, 0, x
+        segs = []
+        for m in ANSI_RE.finditer(text):
+            if m.start() > pos:
+                segs.append((text[pos:m.start()], attr))
+            for code in (m.group(1) or "0").split(";"):
+                code = int(code or 0)
+                if code == 0:
+                    attr = 0
+                elif code == 1:
+                    attr |= curses.A_BOLD
+                elif code == 2:
+                    attr |= curses.A_DIM
+                elif 30 <= code <= 37:
+                    attr = (attr & ~curses.A_COLOR) | curses.color_pair(code - 30)
+            pos = m.end()
+        segs.append((text[pos:], attr))
+        for seg, a in segs:
+            if seg:
+                col = self.put(y, col, seg, a | extra)
+        if fill and col < self.w - 1:
+            self.put(y, col, " " * (self.w - 1 - col), extra)
+
+    def draw(self):
+        scr = self.scr
+        self.h, self.w = scr.getmaxyx()
+        scr.erase()
+        # tab bar
+        x, self.tab_pos = 0, []
+        for i, (name, _) in enumerate(self.TABS):
+            label = f" {i + 1} {name} "
+            a = curses.A_REVERSE | curses.A_BOLD if i == self.tab else curses.A_DIM
+            nx = self.put(0, x, label, a)
+            self.tab_pos.append((x, nx))
+            x = nx + 1
+        v = self.view
+        crumbs = " › ".join(s.title for s in self.stacks[self.tab])
+        if v.filter:
+            crumbs += f"   [filter: {v.filter}]"
+        self.put_ansi(1, 0, cyan(bold(crumbs)) if USE_COLOR else crumbs)
+        # body
+        v.clamp()
+        bh = self.body_h()
+        for i in range(bh):
+            idx = v.top + i
+            if idx >= len(v.rows):
+                break
+            selected = idx == v.sel
+            self.put_ansi(2 + i, 0, v.rows[idx].text, curses.A_REVERSE if selected else 0, fill=selected)
+        # footer
+        n = len(v.rows)
+        right = f" {v.top + 1}-{min(n, v.top + bh)}/{n} " if n > bh else ""
+        left = self.msg or dim(f"{v.hint}{'  ·  ' if v.hint else ''}← back  ? help  q quit")
+        self.put_ansi(self.h - 1, 0, left)
+        if right and len(right) < self.w - 2:
+            self.put(self.h - 1, self.w - 1 - len(right), right, curses.A_DIM)
+        scr.refresh()
+
+
+def run_tui(sh):
+    if curses is None:
+        raise MoodleError("Python curses module not available")
+    if not sys.stdout.isatty():
+        raise MoodleError("the full-screen interface needs a terminal")
+    if not sh.logged_in:
+        print("Not logged in yet — let's do that first.\n")
+        sh.do_login("")
+    TUI(sh).run()
+
+
+# --------------------------------------------------------------------------- #
+
+def main():
+    sh = Shell()
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(HELP.strip())
+        return
+    if argv and argv[0] in ("-V", "--version"):
+        print(f"{APP} {VERSION}")
+        return
+    if not argv or argv[0] == "tui":
+        if sys.stdout.isatty() and curses is not None:
+            try:
+                return run_tui(sh)
+            except MoodleError as e:
+                return err(e)
+            except KeyboardInterrupt:
+                return print()
+        argv = ["shell"]
+    if argv[0] != "shell":
+        sh.onecmd(" ".join(shlex.quote(a) for a in argv))
+        return
+
+    try:
+        import readline
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            readline.read_history_file(HISTORY_FILE)
+        except OSError:
+            pass
+        readline.set_history_length(1000)
+    except ImportError:
+        readline = None
+
+    if sh.logged_in:
+        print(f"{bold('moodle')} · {sh.cfg.get('fullname', '')} @ {sh.cfg.get('sitename', sh.m.url)}   "
+              + dim("type `help` for commands, `tui` for the full-screen view"))
+    else:
+        print(f"{bold('moodle')} — not logged in yet. Type {cyan('login')} to start, {cyan('help')} for commands.")
+    try:
+        sh.cmdloop()
+    except KeyboardInterrupt:
+        print()
+    finally:
+        if readline:
+            try:
+                readline.write_history_file(HISTORY_FILE)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    main()
